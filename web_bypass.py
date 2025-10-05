@@ -1,528 +1,277 @@
 # web_bypass.py
 """
-Arolinks bypass service (single-file).
-UI: GET  /          -> HTML page (JS posts JSON to /bypass)
-API: POST /bypass   -> { url, attempts, headless, include_screenshot }
-Health: GET /health -> {"status":"ok"}
-
-Behavior:
- - Open the provided Arolinks URL
- - Wait for timers/redirects and attempt verification clicks
- - Capture network responses and script-injected links
- - Click "Get Link"/"Continue" style elements when they appear
- - Return the final destination URL (avoid returning intermediate ad pages)
+GPLinks bypass service using cloudscraper + BeautifulSoup (synchronous worker wrapped with asyncio).
+Single-file FastAPI app with embedded UI (no templates).
 """
-import os
-import re
+import asyncio
 import time
-import base64
+import re
 import logging
-from typing import Optional, List, Set
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, HTTPException, Header, Request
+import cloudscraper
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, AnyHttpUrl
-from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError, Response
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("arolinks-bypass")
+logger = logging.getLogger("gplinks-cloudscraper")
 
-app = FastAPI(title="Arolinks Bypass (embedded UI)")
+app = FastAPI(title="GPLinks Bypass (cloudscraper)")
 
 # ---------- Config ----------
-VERIFY_WAIT_SECONDS = 5        # base wait; many arolinks flows use short timers — we'll check repeatedly
-MAX_VERIFY_ROUNDS = 6         # maximum repeated verify/click rounds before giving up
-CLICK_TIMEOUT = 12_000        # ms
-NAV_TIMEOUT = 60_000          # ms
-MAX_TOTAL_WAIT = 90          # seconds per attempt to reach final
+DEFAULT_WAIT_SECONDS = 15
 DEFAULT_ATTEMPTS = 3
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
-API_KEY = os.environ.get("API_KEY")  # optional
 
-# ---------- Request/Response models ----------
+# ---------- Models ----------
 class BypassRequest(BaseModel):
     url: AnyHttpUrl
     attempts: Optional[int] = DEFAULT_ATTEMPTS
-    headless: Optional[bool] = True
-    include_screenshot: Optional[bool] = False
+    wait_seconds: Optional[int] = DEFAULT_WAIT_SECONDS
 
 class BypassResponse(BaseModel):
     final_url: str
-    raw_last_url: str
-    captcha_detected: bool
-    screenshot_b64: Optional[str] = None
+    raw_response_url: str
     attempts_made: int
-    nav_history: Optional[List[str]] = None
     note: Optional[str] = None
 
 # ---------- Helpers ----------
-def is_arolinks(u: Optional[str]) -> bool:
-    if not u:
-        return False
-    return "arolinks" in u.lower()
+INTERMEDIATE_HOSTS = ("procinehub.com", "ad.", "ads.", "short", "interstitial")
 
-def looks_final(u: Optional[str]) -> bool:
-    if not u:
+def looks_intermediate(url: Optional[str]) -> bool:
+    if not url:
         return False
-    s = u.lower()
-    # final if not an arolinks shortener or obvious known intermediates
-    return ("arolinks" not in s) and ("ad" not in s and "procinehub" not in s and "ads" not in s)
+    u = url.lower()
+    return any(h in u for h in INTERMEDIATE_HOSTS)
 
-def resolve_href(base: str, href: str) -> str:
+def resolve_meta_or_js_redirect(html: str, base: str) -> Optional[str]:
+    """Try to extract a redirect URL from meta refresh or simple JS assignments in HTML."""
+    # meta refresh
+    m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']?([^"\'>]+)["\']?', html, re.IGNORECASE)
+    if m:
+        # content like "5; url=https://example.com"
+        mm = re.search(r'url=([^;\'"]+)', m.group(1), re.IGNORECASE)
+        if mm:
+            return urljoin(base, mm.group(1).strip())
+    # simple JS window.location / location.href assignments
+    m2 = re.search(r'window\.location(?:\.href)?\s*=\s*[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
+    if m2:
+        return urljoin(base, m2.group(1))
+    # anchor with obvious final links in body text
+    m3 = re.search(r'href=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
+    if m3:
+        return urljoin(base, m3.group(1))
+    return None
+
+# ---------- Core synchronous bypass function (runs in thread) ----------
+def gplinks_bypass_sync(url: str, wait_seconds: int = DEFAULT_WAIT_SECONDS):
+    """
+    Use cloudscraper to perform the GPLinks flow synchronously.
+    Returns final_url (string) or raises exception.
+    """
+    logger.info("Starting bypass_sync for %s", url)
+    client = cloudscraper.create_scraper(allow_brotli=True, browser={'custom': USER_AGENT})
+    client.headers.update({"User-Agent": USER_AGENT, "Referer": url})
+
+    # 1) GET initial page
     try:
-        return urljoin(base, href)
+        r = client.get(url, allow_redirects=True, timeout=30)
+    except Exception as e:
+        logger.exception("Initial GET failed")
+        raise RuntimeError(f"Initial GET failed: {e}")
+
+    # Keep raw response URL for debugging
+    raw_url = r.url
+
+    # 2) parse for form#go-link
+    soup = BeautifulSoup(r.text, "html.parser")
+    form = soup.find("form", id="go-link")
+    # Some variants may have id "go-link" on a DIV or the form could be missing; try fallback searching for form[action*='links/go']
+    if not form:
+        form = soup.find("form", attrs={"action": re.compile(r"links/go", re.IGNORECASE)})
+    if not form:
+        # If form not found, maybe the page uses a JS-built flow — try to sleep and re-get or return raw location if present
+        logger.debug("form#go-link not found on initial page")
+        # try to detect immediate JSON redirect or direct link in body
+        candidate = None
+        candidate = resolve_meta_or_js_redirect(r.text, r.url)
+        if candidate:
+            return candidate, raw_url, "extracted redirect from page"
+        raise RuntimeError("Could not find go-link form on page; bypass not possible with this method")
+
+    # collect input name/value pairs
+    inputs = form.find_all("input")
+    data = {}
+    for inp in inputs:
+        name = inp.get("name")
+        if not name:
+            continue
+        value = inp.get("value", "")
+        data[name] = value
+
+    # wait (simulate user)
+    logger.info("Waiting %ds before submitting form (simulate timer)", wait_seconds)
+    time.sleep(max(0, int(wait_seconds)))
+
+    # Prepare headers for AJAX POST
+    headers = {
+        "x-requested-with": "XMLHttpRequest",
+        "referer": url,
+        "User-Agent": USER_AGENT,
+    }
+
+    # Attempt POST to /links/go (domain same as initial)
+    parsed = urlparse(url)
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    post_url = urljoin(domain, "/links/go")
+
+    try:
+        post_resp = client.post(post_url, data=data, headers=headers, allow_redirects=False, timeout=30)
+    except Exception as e:
+        logger.exception("POST to links/go failed")
+        raise RuntimeError(f"POST to links/go failed: {e}")
+
+    # Many implementations return JSON with {"url": "..."}
+    final_candidate = None
+    note = None
+    try:
+        j = post_resp.json()
+        final_candidate = j.get("url") or j.get("redirect") or j.get("data") or None
+        note = "from /links/go json"
     except Exception:
-        return href or ""
-
-async def take_screenshot_b64(page: Page) -> str:
-    b = await page.screenshot(full_page=True)
-    return base64.b64encode(b).decode()
-
-# Patterns to find "continue/get" buttons
-ACTION_PATTERNS = [
-    "continue", "get link", "get-link", "getlink", "click here", "open link", "show link", "proceed",
-    "verification", "verify", "download", "generate"
-]
-
-# CSS selector candidates
-CANDIDATE_SELECTORS = [
-    "a", "button", "input[type=button]", "input[type=submit]", "div[role='button']"
-]
-
-# ---------- Network response listener factory ----------
-def make_response_listener(found: Set[str]):
-    async def on_response(resp: Response):
-        try:
-            u = resp.url
-            if not u:
-                return
-            if "arolinks" in u.lower():
-                return
-            # capture responses containing likely final targets
-            if any(k in u.lower() for k in ("generate?code=", "drive.google.com", "googleusercontent", "dl.dropboxusercontent", "herokuapp.com", "cdn.discordapp.com")):
-                found.add(u)
-                return
-            # best-effort: examine short text/json responses for final urls
-            ct = resp.headers.get("content-type", "")
-            if ("text" in ct or "json" in ct) and len(u) < 500:
-                try:
-                    txt = await resp.text()
-                    m = re.search(r'https?://[^\s"\'<>]+/(?:generate\?code=|drive|googleusercontent|dropboxusercontent|discordapp|file|download)[^\s"\'<>]*', txt, re.IGNORECASE)
-                    if m:
-                        found.add(m.group(0))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return on_response
-
-# ---------- Core: attempt that follows the arolinks flow ----------
-async def attempt_follow_arolinks(page: Page, start_url: str, progress_logger=None):
-    """
-    Try to resolve the arolinks flow:
-      - open start_url
-      - repeatedly wait and try clicking 'verify/continue' style elements
-      - capture network responses and DOM-injected links
-      - click final Get/Continue link and return final destination
-    """
-    result = {"final_url": start_url, "raw_last_url": start_url, "captcha_detected": False, "screenshot_b64": None, "nav_history": []}
-    found_network_urls: Set[str] = set()
-    listener = make_response_listener(found_network_urls)
-    page.on("response", listener)
-
-    try:
-        if progress_logger:
-            progress_logger(f"goto {start_url}")
-        try:
-            await page.goto(start_url, timeout=NAV_TIMEOUT)
-        except PlaywrightTimeoutError:
-            if progress_logger:
-                progress_logger("initial goto timeout")
-        except Exception as e:
-            logger.exception("goto error: %s", e)
-
-        result["nav_history"].append(page.url)
-
-        start_time = time.time()
-        rounds = 0
-
-        # We'll iterate: wait short amount, try clicks, scan content/network, repeat up to MAX_VERIFY_ROUNDS
-        while time.time() - start_time < MAX_TOTAL_WAIT and rounds < MAX_VERIFY_ROUNDS:
-            rounds += 1
-            if progress_logger:
-                progress_logger(f"round {rounds}: wait {VERIFY_WAIT_SECONDS}s then scan/click")
-            # wait for timer / ad flow to progress
-            await page.wait_for_timeout(VERIFY_WAIT_SECONDS * 1000)
-
-            # First, check network-discovered URLs (best candidate)
-            if found_network_urls:
-                chosen = sorted(found_network_urls)[0]
-                if progress_logger:
-                    progress_logger(f"network discovered candidate {chosen}")
-                # navigate to it (or return it if looks final)
-                if looks_final(chosen):
-                    result["final_url"] = chosen
-                    result["raw_last_url"] = page.url
-                    try:
-                        result["screenshot_b64"] = await take_screenshot_b64(page)
-                    except Exception:
-                        pass
-                    return result
-                else:
-                    # attempt to navigate to the candidate to see if it resolves further
-                    try:
-                        await page.goto(chosen, timeout=15000)
-                        result["nav_history"].append(page.url)
-                    except Exception:
-                        pass
-
-            # Next, try clicking visible elements that have action-like text
-            clicked = False
-            for sel in CANDIDATE_SELECTORS:
-                try:
-                    elements = await page.query_selector_all(sel)
-                except Exception:
-                    elements = []
-                for el in elements:
-                    try:
-                        # get visible text / aria-label / title
-                        txt = ""
-                        aria = ""
-                        title = ""
-                        try:
-                            txt = (await el.inner_text() or "").strip().lower()
-                        except Exception:
-                            txt = ""
-                        try:
-                            aria = (await el.get_attribute("aria-label") or "").strip().lower()
-                        except Exception:
-                            aria = ""
-                        try:
-                            title = (await el.get_attribute("title") or "").strip().lower()
-                        except Exception:
-                            title = ""
-                        combined = " ".join([txt, aria, title]).strip()
-                        # skip empty elements
-                        if not combined:
-                            # small heuristic: if element has href attribute, consider it
-                            try:
-                                href = await el.get_attribute("href")
-                                if href and ("http" in href or href.startswith("/")):
-                                    combined = href.lower()
-                            except Exception:
-                                pass
-                        # if combined contains any action pattern, try clicking
-                        if any(p in combined for p in ACTION_PATTERNS) or ("getlink" in combined) or ("get-link" in combined):
-                            try:
-                                if progress_logger:
-                                    progress_logger(f"Clicking element with text '{combined[:80]}'")
-                                # Try click
-                                await el.click(timeout=CLICK_TIMEOUT)
-                                clicked = True
-                                # wait a bit for network / nav
-                                try:
-                                    await page.wait_for_load_state("networkidle", timeout=4000)
-                                except Exception:
-                                    await page.wait_for_timeout(1200)
-                                result["nav_history"].append(page.url)
-                                # if navigation reached a final-looking url, return it
-                                if looks_final(page.url):
-                                    result["final_url"] = page.url
-                                    result["raw_last_url"] = page.url
-                                    try:
-                                        result["screenshot_b64"] = await take_screenshot_b64(page)
-                                    except Exception:
-                                        pass
-                                    return result
-                            except Exception:
-                                # fallback evaluate click
-                                try:
-                                    await page.evaluate("(e)=>e.click()", el)
-                                    clicked = True
-                                    await page.wait_for_timeout(1200)
-                                    result["nav_history"].append(page.url)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                if clicked:
-                    break
-
-            # After clicks, check page content for direct final links injected into page
-            try:
-                content = await page.content()
-                # search for final link patterns (drive, googleusercontent, heroku, dropbox, discord CDN, direct file)
-                m = re.search(r'https?://[^\s"\'<>]+/(?:generate\?code=|drive|googleusercontent|dropboxusercontent|discordapp|cdn\.|file|download)[^\s"\'<>]*', content, re.IGNORECASE)
+        # Not JSON — maybe a redirect or HTML response
+        # if Location header present
+        loc = post_resp.headers.get("Location")
+        if loc:
+            final_candidate = urljoin(post_resp.url, loc)
+            note = "from Location header"
+        else:
+            # try parsing text for link
+            text = post_resp.text or ""
+            cand = resolve_meta_or_js_redirect(text, post_resp.url)
+            if cand:
+                final_candidate = cand
+                note = "from post response body"
+            else:
+                # fallback: maybe the original domain returned JSON in r.text earlier; try searching
+                m = re.search(r'https?://[^\s"\'<>]+', post_resp.text or "")
                 if m:
-                    candidate = m.group(0)
-                    if progress_logger:
-                        progress_logger(f"Found candidate in page content: {candidate}")
-                    if looks_final(candidate):
-                        result["final_url"] = candidate
-                        result["raw_last_url"] = page.url
-                        try:
-                            result["screenshot_b64"] = await take_screenshot_b64(page)
-                        except Exception:
-                            pass
-                        return result
-            except Exception:
-                pass
+                    final_candidate = m.group(0)
+                    note = "from text search"
 
-            # detect captcha-like content
-            try:
-                txt = await page.content()
-            except Exception:
-                txt = ""
-            if any(k in txt.lower() for k in ("captcha", "recaptcha", "hcaptcha", "i am not a robot", "please verify")):
-                result["captcha_detected"] = True
-                result["raw_last_url"] = page.url
-                try:
-                    result["screenshot_b64"] = await take_screenshot_b64(page)
-                except Exception:
-                    pass
-                return result
+    if not final_candidate:
+        raise RuntimeError("Could not extract final URL from POST response")
 
-            # If nothing actionable yet, try a gentle navigation of anchors to escape intermediates like procinehub
-            cur = page.url or ""
-            if ("procinehub" in cur.lower() or "ad" in cur.lower()) and not looks_final(cur):
-                try:
-                    anchors = await page.query_selector_all("a[href]")
-                    for a in anchors:
-                        try:
-                            href = await a.get_attribute("href")
-                            if not href:
-                                continue
-                            full = resolve_href(page.url, href)
-                            if looks_final(full):
-                                if progress_logger:
-                                    progress_logger(f"Following anchor to candidate final {full}")
-                                try:
-                                    await page.goto(full, timeout=15000)
-                                    result["nav_history"].append(page.url)
-                                    if looks_final(page.url):
-                                        result["final_url"] = page.url
-                                        result["raw_last_url"] = page.url
-                                        try:
-                                            result["screenshot_b64"] = await take_screenshot_b64(page)
-                                        except Exception:
-                                            pass
-                                        return result
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            # small sleep and continue next round
-            await page.wait_for_timeout(1000)
-
-        # end rounds: fallback - if found network url choose first non-arolinks
-        if found_network_urls:
-            for candidate in sorted(found_network_urls):
-                if looks_final(candidate):
-                    result["final_url"] = candidate
-                    result["raw_last_url"] = page.url
-                    try:
-                        result["screenshot_b64"] = await take_screenshot_b64(page)
-                    except Exception:
-                        pass
-                    return result
-
-        # final fallback: try anchors on page to find external link
+    # If candidate is an intermediate host (procinehub or similar), try to follow it once to find a redirect/final url
+    if looks_intermediate(final_candidate):
+        logger.info("Final candidate appears intermediate (%s). Following it once to try to find final.", final_candidate)
         try:
-            anchors = await page.query_selector_all("a[href]")
-            for a in anchors:
-                try:
-                    href = await a.get_attribute("href")
-                    if not href:
-                        continue
-                    full = resolve_href(page.url, href)
-                    if looks_final(full):
-                        result["final_url"] = full
-                        result["raw_last_url"] = page.url
-                        try:
-                            result["screenshot_b64"] = await take_screenshot_b64(page)
-                        except Exception:
-                            pass
-                        return result
-                except Exception:
-                    pass
+            follow = client.get(final_candidate, allow_redirects=True, timeout=30)
+            # if final redirected to new location, follow.url will be the final
+            follow_url = follow.url
+            # check meta/js in the page for final
+            meta = resolve_meta_or_js_redirect(follow.text or "", follow_url)
+            if meta and meta != follow_url:
+                return meta, raw_url, "followed intermediate -> meta/js"
+            # otherwise if follow_url seems final (not intermediate) return it
+            if not looks_intermediate(follow_url):
+                return follow_url, raw_url, "followed intermediate -> final"
         except Exception:
-            pass
+            logger.exception("Following intermediate candidate failed")
+            # give up on follow
 
-        # give up: return last page.url
-        result["final_url"] = page.url or start_url
-        result["raw_last_url"] = page.url or start_url
-        try:
-            result["screenshot_b64"] = await take_screenshot_b64(page)
-        except Exception:
-            pass
-        return result
+    return final_candidate, raw_url, note or "extracted"
 
-    except Exception:
-        logger.exception("attempt_follow_arolinks error")
-        result["final_url"] = start_url
-        result["raw_last_url"] = start_url
-        try:
-            result["screenshot_b64"] = await take_screenshot_b64(page)
-        except Exception:
-            pass
-        return result
-    finally:
-        try:
-            page.remove_listener("response", listener)
-        except Exception:
-            pass
-
-# ---------- POST /bypass endpoint ----------
+# ---------- Async wrapper endpoint ----------
 @app.post("/bypass")
-async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(None)):
-    # optional API key check
-    if API_KEY:
-        if not x_api_key or x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Missing/invalid API key")
-
+async def bypass(req: BypassRequest):
     url = str(req.url)
     attempts = max(1, min(6, int(req.attempts or DEFAULT_ATTEMPTS)))
-    headless = bool(req.headless)
-    include_screenshot = bool(req.include_screenshot)
+    wait_seconds = max(0, int(req.wait_seconds or DEFAULT_WAIT_SECONDS))
 
-    logger.info("Arolinks bypass request: url=%s attempts=%s headless=%s", url, attempts, headless)
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = await browser.new_context(user_agent=USER_AGENT)
-        page = await context.new_page()
-
-        final = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None, "nav_history": []}
-        attempt_made = 0
+    last_err = None
+    for attempt in range(1, attempts + 1):
         try:
-            for i in range(1, attempts + 1):
-                attempt_made = i
-                # tiny human-like move
-                try:
-                    await page.mouse.move(100, 100)
-                except Exception:
-                    pass
+            final, raw, note = await asyncio.to_thread(gplinks_bypass_sync, url, wait_seconds)
+            # ensure we return absolute url string
+            if final and isinstance(final, str):
+                # some short responses may be relative - resolve
+                final_url = final
+                # final sanity: if looks_intermediate and we have more attempts, retry once
+                if looks_intermediate(final_url) and attempt < attempts:
+                    logger.info("Attempt %d returned intermediate '%s' — retrying (attempt %d/%d)", attempt, final_url, attempt+1, attempts)
+                    last_err = f"intermediate:{final_url}"
+                    continue
+                resp = BypassResponse(final_url=final_url, raw_response_url=raw, attempts_made=attempt, note=str(note))
+                return JSONResponse(status_code=200, content=resp.dict())
+            else:
+                last_err = "no final url extracted"
+        except Exception as e:
+            logger.exception("Bypass attempt %d failed", attempt)
+            last_err = str(e)
+            # small backoff before retry
+            await asyncio.sleep(1 + attempt)
 
-                res = await attempt_follow_arolinks(page, url, progress_logger=lambda t: logger.info("BYPASS: %s", t))
-                final.update(res)
-                final["nav_history"] = res.get("nav_history", [])
+    raise HTTPException(status_code=502, detail=f"Bypass failed after {attempts} attempts: {last_err}")
 
-                # if final looks final (not arolinks) done
-                if looks_final(final.get("final_url")):
-                    break
-
-                # else small backoff and reload
-                if i < attempts:
-                    backoff = (2 ** i) + 0.5 * i
-                    logger.info("Retrying in %.1fs", backoff)
-                    await page.wait_for_timeout(int(backoff * 1000))
-                    try:
-                        await page.reload(timeout=5000)
-                        await page.wait_for_timeout(1000)
-                    except Exception:
-                        pass
-
-        finally:
-            if include_screenshot and page:
-                try:
-                    final["screenshot_b64"] = await take_screenshot_b64(page)
-                except Exception:
-                    final["screenshot_b64"] = None
-            try:
-                await context.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
-
-    resp = BypassResponse(
-        final_url = final.get("final_url") or url,
-        raw_last_url = final.get("raw_last_url") or url,
-        captcha_detected = bool(final.get("captcha_detected")),
-        screenshot_b64 = final.get("screenshot_b64"),
-        attempts_made = attempt_made,
-        nav_history = final.get("nav_history", []),
-    )
-    return JSONResponse(status_code=200, content=resp.dict())
-
-# ---------- Embedded UI (no templates) ----------
+# ---------- Simple embedded UI ----------
 @app.get("/", response_class=HTMLResponse)
-async def ui_index(request: Request):
+async def index(request: Request):
     html = r'''
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Arolinks Bypass</title>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>GPLinks Bypass (cloudscraper)</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:16px;background:#f5f7fb}
-    .card{max-width:900px;margin:18px auto;padding:20px;background:#fff;border-radius:10px}
-    input[type=text]{width:68%;padding:10px;border-radius:6px;border:1px solid #ddd}
-    button{padding:10px 14px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:18px;background:#f5f7fb}
+    .card{max-width:880px;margin:18px auto;padding:20px;background:#fff;border-radius:10px}
+    input[type=text]{width:66%;padding:10px;border-radius:6px;border:1px solid #ddd}
+    button{padding:9px 12px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer}
     pre{background:#f7f8fb;padding:12px;border-radius:6px;white-space:pre-wrap}
-    img.debug{max-width:100%;margin-top:8px;border-radius:6px;border:1px solid #eee}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Arolinks Bypass</h2>
-    <p>Paste an <strong>Arolinks</strong> URL below, press Start. The service will follow timers and verification clicks and return the final destination.</p>
+    <h2>GPLinks Bypass (cloudscraper)</h2>
+    <p>Paste GPLinks URL (or similar) and press Start. This tool will wait the timer, submit the hidden form and return the final URL.</p>
     <div>
-      <input id="alink" type="text" placeholder="https://arolinks.com/..." />
-      <button onclick="startBypass()">Start</button>
+      <input id="gplink" type="text" placeholder="https://gplinks.co/XXXX" />
+      <button onclick="start()">Start</button>
     </div>
     <div style="margin-top:12px;">
       <label>Attempts: <input id="attempts" type="number" value="3" min="1" max="6" style="width:72px" /></label>
-      <label style="margin-left:12px"><input id="headless" type="checkbox" checked/> Headless</label>
-      <label style="margin-left:12px"><input id="screenshot" type="checkbox" /> Include screenshot</label>
-      <label style="margin-left:12px">API Key: <input id="apikey" type="text" placeholder="(optional)" style="width:200px"/></label>
+      <label style="margin-left:12px">Wait seconds: <input id="wait" type="number" value="15" min="0" max="60" style="width:72px" /></label>
     </div>
-    <div id="spinner" style="display:none;margin-top:12px">⏳ Bypassing — this may take up to ~90s...</div>
+    <div id="spinner" style="display:none;margin-top:12px">⏳ Bypassing — please wait...</div>
     <div id="output" style="margin-top:14px"></div>
   </div>
 
 <script>
-function escapeHtml(s){ if(!s) return ''; return s.replace(/'/g,"\\'").replace(/"/g,'\\"'); }
-
-async function startBypass(){
-  const url = document.getElementById('alink').value.trim();
-  if(!url){ alert('Please enter an Arolinks URL'); return; }
+async function start(){
+  const url = document.getElementById('gplink').value.trim();
+  if(!url){ alert('Enter a GPLinks URL'); return; }
   const attempts = parseInt(document.getElementById('attempts').value || '3', 10);
-  const headless = document.getElementById('headless').checked;
-  const include_screenshot = document.getElementById('screenshot').checked;
-  const apikey = document.getElementById('apikey').value.trim();
-
+  const wait = parseInt(document.getElementById('wait').value || '15', 10);
   document.getElementById('spinner').style.display = 'block';
   document.getElementById('output').innerHTML = '';
-
   try{
-    const headers = {'Content-Type':'application/json'};
-    if(apikey) headers['x-api-key'] = apikey;
     const res = await fetch('/bypass', {
       method: 'POST',
-      headers: headers,
-      body: JSON.stringify({ url: url, attempts: attempts, headless: headless, include_screenshot: include_screenshot })
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ url: url, attempts: attempts, wait_seconds: wait })
     });
-    if(!res.ok){
-      const err = await res.json().catch(()=>({detail:res.statusText}));
-      document.getElementById('output').innerText = 'Error: ' + (err.detail || JSON.stringify(err));
-      return;
-    }
     const data = await res.json();
-    let html = `<pre>✅ Final URL: ${data.final_url}\nAttempts: ${data.attempts_made}\nCaptcha Detected: ${data.captcha_detected}\nRaw Last URL: ${data.raw_last_url}\nNav history: ${JSON.stringify(data.nav_history || [])}</pre>`;
-    html += `<p><button onclick="window.open('${escapeHtml(data.final_url)}','_blank')">Open final URL</button></p>`;
-    if(data.screenshot_b64){
-      html += `<p><a href="data:image/png;base64,${data.screenshot_b64}" download="screenshot.png">Download screenshot</a></p>`;
-      html += `<p><img class="debug" src="data:image/png;base64,${data.screenshot_b64}" /></p>`;
+    if(!res.ok){
+      document.getElementById('output').innerText = 'Error: ' + (data.detail || JSON.stringify(data));
+    } else {
+      let html = `<pre>✅ Final URL: ${data.final_url}\nRaw response URL: ${data.raw_response_url}\nAttempts used: ${data.attempts_made}\nNote: ${data.note || ''}</pre>`;
+      html += `<p><button onclick="window.open('${data.final_url}','_blank')">Open final URL</button></p>`;
+      document.getElementById('output').innerHTML = html;
     }
-    document.getElementById('output').innerHTML = html;
   }catch(e){
     document.getElementById('output').innerText = 'Error: ' + e;
   }finally{
@@ -534,3 +283,8 @@ async function startBypass(){
 </html>
 '''
     return HTMLResponse(content=html)
+
+# ---------- Health ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
