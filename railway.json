@@ -5,5 +5,5 @@
     },
     "cmd": "playwright install"
   },
-  "start": "python bot.py"
+  "start": "uvicorn web_bypass:app --host 0.0.0.0 --port 8080 --proxy-headers"
 }
