@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache
+*.pym
+
+# Virtual environments
+venv/
+.env
+.env.*
+
+# Playwright temp/browser cache
+playwright/.local-browsers/
+playwright/.cache/
+*.log
+
+# Temporary screenshots
+/tmp/
+*.png
+*.jpg
+*.jpeg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Railway files (optional)
+.railway/
