@@ -1,16 +1,23 @@
 import asyncio
 import os
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.types import Message
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
 
+# Get bot token from environment variable
 TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+
+# ✅ Correct Bot init for aiogram 3.7+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher(storage=MemoryStorage())
 
-
+# Bypass function using Playwright
 async def bypass_gplinks(url):
     async with async_playwright() as p:
         browser = await p.webkit.launch(headless=True)
@@ -22,7 +29,7 @@ async def bypass_gplinks(url):
         await page.wait_for_timeout(8000)
         return page.url
 
-
+# Handle incoming messages
 @dp.message()
 async def handle_message(message: Message):
     if "gplinks.co" not in message.text:
@@ -35,7 +42,7 @@ async def handle_message(message: Message):
     except Exception as e:
         await message.answer(f"⚠️ Error: {e}")
 
-
+# Entry point
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
