@@ -1,12 +1,15 @@
 import asyncio
+import os
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 from playwright.async_api import async_playwright
 
-import os
 TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=MemoryStorage())
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
 
 async def bypass_gplinks(url):
     async with async_playwright() as p:
@@ -19,18 +22,23 @@ async def bypass_gplinks(url):
         await page.wait_for_timeout(8000)
         return page.url
 
-@dp.message_handler()
-async def handle_message(message: types.Message):
+
+@dp.message()
+async def handle_message(message: Message):
     if "gplinks.co" not in message.text:
-        await message.reply("❌ Please send a valid GPLinks URL.")
+        await message.answer("❌ Please send a valid GPLinks URL.")
         return
     try:
-        await message.reply("⏳ Bypassing, please wait...")
+        await message.answer("⏳ Bypassing, please wait...")
         final_url = await bypass_gplinks(message.text.strip())
-        await message.reply(f"✅ Final URL:\n{final_url}")
+        await message.answer(f"✅ Final URL:\n{final_url}")
     except Exception as e:
-        await message.reply(f"⚠️ Error: {e}")
+        await message.answer(f"⚠️ Error: {e}")
 
-if __name__ == '__main__':
-    from aiogram import executor
-    executor.start_polling(dp)
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
