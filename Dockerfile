@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libdbus-1-3 libxcb1 libx11-6 fonts-liberation curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
 
 # Copy requirements first for caching
@@ -19,43 +20,14 @@ COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Install Playwright browsers
+# Install Playwright browsers (chromium only)
 RUN playwright install --with-deps chromium
 
 # Copy all project files
 COPY . .
 
-# Ensure Python outputs logs in real-time
+# Ensure Python logs are unbuffered
 ENV PYTHONUNBUFFERED=1
 
-# Command to start FastAPI with uvicorn
-CMD ["uvicorn", "web_bypass:app", "--host", "0.0.0.0", "--port", "8080"]# -----------------------------
-# Copy Python dependencies and install
-# -----------------------------
-COPY requirements.txt .
-
-RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
-
-# -----------------------------
-# Install Playwright browsers
-# -----------------------------
-# Chromium is enough for most cases; add firefox/webkit if needed
-RUN playwright install --with-deps chromium
-
-# -----------------------------
-# Copy bot code
-# -----------------------------
-COPY . .
-
-# -----------------------------
-# Environment settings
-# -----------------------------
-# Ensures Python prints logs to stdout immediately
-ENV PYTHONUNBUFFERED=1
-
-# -----------------------------
-# Default command
-# -----------------------------
-# Starts the bot
-CMD ["python", "bot.py"]
+# Start the web service (web_bypass.py)
+CMD ["uvicorn", "web_bypass:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
