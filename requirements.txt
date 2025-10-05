@@ -1,11 +1,4 @@
-# Telegram bot framework
 aiogram>=3.7.0,<4.0.0
-
-# Playwright for browser automation
 playwright>=1.35.0
-
-# Optional: Pillow (for FSInputFile screenshot handling)
 Pillow>=10.0.0
-
-# Typing / modern features (Python 3.11+ recommended)
 typing-extensions>=4.7.1

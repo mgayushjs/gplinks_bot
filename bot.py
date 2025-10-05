@@ -1,12 +1,7 @@
 # bot.py
 """
-GPLinks bypass Telegram bot (improved)
-- aiogram 3.7+ compatible
-- Playwright Chromium automation
-- Increased waits, explicit redirect-button clicks, per-attempt screenshots
-- Retries (default 5) + human-like simulation (stronger)
-- Runtime toggles: /set_headless, /set_retries, /set_mouse, /status
-Only BOT_TOKEN env var required.
+GPLinks bypass bot - aiogram 3.7+ + Playwright
+Save as bot.py. Set only BOT_TOKEN (and optionally ADMIN_CHAT_ID) in Railway environment.
 """
 
 import asyncio
@@ -27,60 +22,66 @@ from aiogram.filters import Command, BaseFilter
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # -----------------------------
-# Minimal required env var
+# Required env vars
 # -----------------------------
 TOKEN = os.getenv("BOT_TOKEN")
-if TOKEN is None:
+if not TOKEN:
     raise SystemExit("BOT_TOKEN environment variable must be set")
 
+# Optional admin chat id (useful for debugging)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # string or None
+
 # -----------------------------
-# Runtime-configurable settings (only BOT_TOKEN required)
+# Runtime-configurable defaults
 # -----------------------------
 CONFIG = {
-    "HEADLESS": True,        # True => headless; False => visible browser
-    "RETRY_ATTEMPTS": 5,     # default number of tries (increased)
-    "SIMULATE_MOUSE": True,  # human-like interactions
+    "HEADLESS": True,
+    "RETRY_ATTEMPTS": 4,
+    "SIMULATE_MOUSE": True,
 }
 
-# Non-runtime tuning constants (can be changed in-code)
-BASE_NAV_TIMEOUT = 60_000     # ms
-BASE_CLICK_TIMEOUT = 12_000   # ms
-MAX_TOTAL_WAIT = 60           # seconds per attempt (increased)
+# tuning (can be changed in code)
+BASE_NAV_TIMEOUT = 60_000
+BASE_CLICK_TIMEOUT = 12_000
+MAX_TOTAL_WAIT = 60  # seconds per attempt
 SCREENSHOT_DIR = "/tmp"
 SCREENSHOT_PATH_TEMPLATE = os.path.join(SCREENSHOT_DIR, "gplinks_debug_attempt_{attempt}.png")
-LOG_TO_TELEGRAM = True        # progress updates are sent to invoking chat
-TELEGRAM_LOG_CHAT_ID = None   # if set, logs always go to that chat id
 
-# Retry/backoff settings
-BACKOFF_BASE = 2.0     # backoff factor
-JITTER_SEC = 1.5       # jitter for backoff
-
-# Human-like interaction settings (increased)
+# human-like sim
 MOUSE_MOVES_PER_ATTEMPT = 12
 CLICK_PROBABILITY = 0.6
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("gplinks-bot")
 
-# -----------------------------
-# Aiogram / Bot setup (aiogram 3.7+)
-# -----------------------------
+# aiogram setup
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 
 # -----------------------------
-# Fallback filter to catch any text message
+# Filters / Utilities
 # -----------------------------
 class AnyTextFilter(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         return bool(message.text)
 
 
-# -----------------------------
-# Utilities: send/edit progress messages
-# -----------------------------
-async def send_progress(chat_id: int, text: str, reply_to_message_id: Optional[int] = None, edit_message: Optional[Message] = None) -> Optional[Message]:
+def extract_url_from_text(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    # permissive capture of gplinks URL (with or without scheme)
+    m = re.search(r'(https?://)?(?:www\.)?gplinks\.co/[^\s)]+', text, re.IGNORECASE)
+    if not m:
+        return None
+    found = m.group(0)
+    if not found.lower().startswith("http"):
+        found = "https://" + found
+    return found
+
+
+async def send_progress(chat_id: int, text: str, edit_message: Optional[Message] = None, reply_to_message_id: Optional[int] = None) -> Optional[Message]:
     try:
         if edit_message:
             return await edit_message.edit_text(text)
@@ -92,7 +93,7 @@ async def send_progress(chat_id: int, text: str, reply_to_message_id: Optional[i
 
 
 # -----------------------------
-# Human-like interactions utilities
+# Playwright helper: small human-like interactions
 # -----------------------------
 async def do_human_like_actions(page, attempt_num: int):
     try:
@@ -100,7 +101,6 @@ async def do_human_like_actions(page, attempt_num: int):
         w = viewport.get("width", 1280)
         h = viewport.get("height", 720)
 
-        # small random scroll sometimes
         if random.random() < 0.6:
             y_scroll = random.randint(0, max(0, h // 6))
             try:
@@ -109,7 +109,6 @@ async def do_human_like_actions(page, attempt_num: int):
             except Exception:
                 pass
 
-        # mouse moves
         moves = MOUSE_MOVES_PER_ATTEMPT + int(attempt_num)
         for _ in range(moves):
             x = random.randint(int(w * 0.1), int(w * 0.9))
@@ -120,7 +119,6 @@ async def do_human_like_actions(page, attempt_num: int):
                 pass
             await page.wait_for_timeout(random.randint(60, 260))
 
-        # occasional benign click
         if random.random() < CLICK_PROBABILITY:
             try:
                 cx = w // 2 + random.randint(-150, 150)
@@ -135,21 +133,16 @@ async def do_human_like_actions(page, attempt_num: int):
 
 
 # -----------------------------
-# Low-level single attempt (with explicit redirect-button click)
+# Single attempt - improved with explicit button click and screenshots
 # -----------------------------
 async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: int, attempt: int, progress_callback=None) -> dict:
-    """
-    Attempt single-pass bypass using selectors/sniffing. Saves per-attempt screenshot.
-    Returns dict: { final_url, screenshot, captcha_detected, raw_last_page_url }
-    """
     result = {"final_url": url, "screenshot": None, "captcha_detected": False, "raw_last_page_url": url}
     screenshot_path = SCREENSHOT_PATH_TEMPLATE.format(attempt=attempt)
 
     try:
         if progress_callback:
-            await progress_callback(f"[Attempt {attempt}] Navigating to {url} (nav_timeout={nav_timeout}ms)...")
+            await progress_callback(f"[Attempt {attempt}] Navigating to {url} ...")
 
-        # initial goto
         try:
             await page.goto(url, timeout=nav_timeout)
         except PlaywrightTimeoutError:
@@ -157,9 +150,8 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
         except Exception:
             logger.exception("Navigation error on attempt %d", attempt)
 
-        # Try explicit click on common redirect button(s) before main loop
+        # try explicit button click(s) often present on GPLinks
         try:
-            # wait up to 20s for the main button(s) that often exist on gplinks pages
             btn = await page.wait_for_selector("a#btn-main, button#btn-main, a[role='button']", timeout=20000)
             if btn:
                 try:
@@ -170,7 +162,6 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
                 except Exception:
                     logger.debug("Redirect button click failed on attempt %d", attempt)
         except Exception:
-            # not fatal; continue to loop where we try other selectors
             pass
 
         def looks_final(u: str) -> bool:
@@ -183,10 +174,8 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
             current_url = page.url
             result["raw_last_page_url"] = current_url
 
-            # if left gplinks domain, done
             if looks_final(current_url) and current_url != url:
                 result["final_url"] = current_url
-                # take final screenshot for debugging (optional)
                 try:
                     await page.screenshot(path=screenshot_path, full_page=True)
                     result["screenshot"] = screenshot_path
@@ -194,15 +183,14 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
                     pass
                 return result
 
-            # fetch page content
             try:
                 content = await page.content()
             except Exception:
                 content = ""
 
-            # captcha detection heuristics
+            # detect captcha-like content
             captcha_keywords = ["captcha", "recaptcha", "hcaptcha", "please verify", "i am not a robot"]
-            if any(k.lower() in content.lower() for k in captcha_keywords):
+            if any(k in content.lower() for k in captcha_keywords):
                 result["captcha_detected"] = True
                 try:
                     await page.screenshot(path=screenshot_path, full_page=True)
@@ -211,10 +199,10 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
                     pass
                 return result
 
-            # try clicking common selectors
+            # click common selectors
             selectors = [
-                "a#btn-main", "a[href*='redirect']", "a[href*='http']",
-                "a.btn", "button#btn-main", "button", "input[type=submit]", "a[role='button']"
+                "a#btn-main", "a[href*='redirect']", "a[href*='http']", "a.btn",
+                "button#btn-main", "button", "input[type=submit]", "a[role='button']"
             ]
             for sel in selectors:
                 try:
@@ -228,13 +216,12 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
                 except Exception:
                     pass
 
-            # wait for networkidle briefly
             try:
                 await page.wait_for_load_state("networkidle", timeout=3000)
             except Exception:
                 pass
 
-            # meta refresh sniff
+            # sniff meta refresh
             try:
                 m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']?([^"\']+)["\']?', content, re.IGNORECASE)
                 if m:
@@ -249,11 +236,11 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
             except Exception:
                 pass
 
-            # js redirect sniff
+            # sniff js redirect
             try:
-                js_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
-                if js_match:
-                    target = urljoin(page.url, js_match.group(1).strip())
+                js = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
+                if js:
+                    target = urljoin(page.url, js.group(1).strip())
                     try:
                         await page.goto(target, timeout=15000)
                         continue
@@ -262,7 +249,7 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
             except Exception:
                 pass
 
-            # external anchor detection & try navigate
+            # external anchors
             try:
                 anchors = await page.query_selector_all("a")
                 for a in anchors:
@@ -285,19 +272,17 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
                                         pass
                                     return result
                             except Exception:
-                                # fallback: return the external href as best-effort
                                 return {"final_url": full, "screenshot": None, "captcha_detected": False, "raw_last_page_url": page.url}
                     except Exception:
                         pass
             except Exception:
                 pass
 
-            # nothing changed — short wait
             if page.url != last_url:
                 last_url = page.url
             await page.wait_for_timeout(1000)
 
-        # timeout reached: take screenshot and return best-effort
+        # timeout reached
         try:
             await page.screenshot(path=screenshot_path, full_page=True)
             result["screenshot"] = screenshot_path
@@ -307,8 +292,7 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
         return result
 
     except Exception:
-        logger.exception("Unexpected error in single attempt")
-        # attempt one last screenshot
+        logger.exception("Unexpected error in attempt_bypass_once")
         try:
             await page.screenshot(path=screenshot_path, full_page=True)
             result["screenshot"] = screenshot_path
@@ -318,29 +302,22 @@ async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: i
 
 
 # -----------------------------
-# Top-level bypass: retries, backoff, simulation
+# Top-level bypass with retries + human-like actions
 # -----------------------------
 async def bypass_gplinks(url: str, progress_callback=None) -> dict:
-    attempts = int(CONFIG.get("RETRY_ATTEMPTS", 5))
+    attempts = int(CONFIG.get("RETRY_ATTEMPTS", 4))
     headless = bool(CONFIG.get("HEADLESS", True))
     simulate_mouse = bool(CONFIG.get("SIMULATE_MOUSE", True))
 
-    logger.info("Starting bypass: attempts=%d headless=%s simulate_mouse=%s url=%s",
-                attempts, headless, simulate_mouse, url)
+    logger.info("bypass_gplinks start: attempts=%s headless=%s simulate_mouse=%s url=%s", attempts, headless, simulate_mouse, url)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/116.0.0.0 Safari/537.36",
-            java_script_enabled=True,
-        )
+        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36", java_script_enabled=True)
         page = await context.new_page()
 
         try:
             last_result = {"final_url": url, "screenshot": None, "captcha_detected": False, "raw_last_page_url": url}
-
             for attempt in range(1, attempts + 1):
                 nav_timeout = int(BASE_NAV_TIMEOUT * (1 + 0.25 * (attempt - 1)))
                 click_timeout = int(BASE_CLICK_TIMEOUT * (1 + 0.15 * (attempt - 1)))
@@ -348,17 +325,15 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
                 if progress_callback:
                     await progress_callback(f"Attempt {attempt}/{attempts} — nav_timeout={nav_timeout}ms")
 
-                # stronger human-like simulation
                 if simulate_mouse:
                     await do_human_like_actions(page, attempt)
 
                 res = await attempt_bypass_once(page, url, nav_timeout, click_timeout, attempt, progress_callback=progress_callback)
                 last_result = res
 
-                # stop early on captcha or success
                 if res.get("captcha_detected"):
                     if progress_callback:
-                        await progress_callback("CAPTCHA detected — aborting further attempts.")
+                        await progress_callback("CAPTCHA detected — aborting attempts.")
                     return res
 
                 def looks_final(u: str) -> bool:
@@ -369,10 +344,10 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
                         await progress_callback(f"Success on attempt {attempt}: {res.get('final_url')}")
                     return res
 
-                # if more attempts remain, backoff + reload
+                # backoff
                 if attempt < attempts:
-                    backoff = (BACKOFF_BASE ** attempt)
-                    jitter = random.uniform(-JITTER_SEC, JITTER_SEC)
+                    backoff = (2.0 ** attempt)
+                    jitter = random.uniform(-1.5, 1.5)
                     wait_t = max(0.5, backoff + jitter)
                     if progress_callback:
                         await progress_callback(f"No final URL yet — waiting {wait_t:.1f}s before retry {attempt+1}...")
@@ -383,7 +358,7 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
                         pass
 
             if progress_callback:
-                await progress_callback("All attempts completed — returning best-observed result.")
+                await progress_callback("All attempts done — returning best observed result.")
             return last_result
 
         finally:
@@ -398,36 +373,17 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
 
 
 # -----------------------------
-# URL extractor (more permissive)
-# -----------------------------
-def extract_url_from_text(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    # capture gplinks variants and shortlinks without protocol too
-    m = re.search(r'(https?://)?(?:www\.)?gplinks\.co/[^\s)]+', text, re.IGNORECASE)
-    if not m:
-        return None
-    found = m.group(0)
-    # ensure scheme present
-    if not found.lower().startswith("http"):
-        found = "https://" + found
-    return found
-
-
-# -----------------------------
-# Telegram command handlers: runtime toggles & status
+# Command handlers and main handler
 # -----------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.reply(
-        "👋 Hello! Send me a GPLinks.co URL (or reply to a message containing one) and I'll try to bypass it.\n\n"
-        "Commands:\n"
-        "/bypass <url> — bypass a link\n"
-        "/status — show current settings\n"
-        "/set_headless on|off\n"
-        "/set_retries <number>\n"
-        "/set_mouse on|off\n"
-    )
+    await message.reply("👋 Hello! Send a GPLinks URL (https://gplinks.co/...) or reply to a message containing one. Use /status to see config.")
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    lines = [f"{k}: {v}" for k, v in CONFIG.items()]
+    await message.reply("Current settings:\n" + "\n".join(lines))
 
 
 @dp.message(Command("set_headless"))
@@ -437,7 +393,7 @@ async def cmd_set_headless(message: Message):
         await message.reply("Usage: /set_headless on|off")
         return
     CONFIG["HEADLESS"] = args[1].lower() == "on"
-    await message.reply(f"HEADLESS set to {CONFIG['HEADLESS']}. (No restart required.)")
+    await message.reply(f"HEADLESS set to {CONFIG['HEADLESS']}")
 
 
 @dp.message(Command("set_retries"))
@@ -447,7 +403,7 @@ async def cmd_set_retries(message: Message):
         await message.reply("Usage: /set_retries <number>")
         return
     CONFIG["RETRY_ATTEMPTS"] = max(1, int(args[1]))
-    await message.reply(f"RETRY_ATTEMPTS set to {CONFIG['RETRY_ATTEMPTS']}.")
+    await message.reply(f"RETRY_ATTEMPTS set to {CONFIG['RETRY_ATTEMPTS']}")
 
 
 @dp.message(Command("set_mouse"))
@@ -457,98 +413,96 @@ async def cmd_set_mouse(message: Message):
         await message.reply("Usage: /set_mouse on|off")
         return
     CONFIG["SIMULATE_MOUSE"] = args[1].lower() == "on"
-    await message.reply(f"SIMULATE_MOUSE set to {CONFIG['SIMULATE_MOUSE']}.")
+    await message.reply(f"SIMULATE_MOUSE set to {CONFIG['SIMULATE_MOUSE']}")
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    status_lines = [f"{k}: {v}" for k, v in CONFIG.items()]
-    await message.reply("Current configuration:\n" + "\n".join(status_lines))
-
-
-# -----------------------------
-# Main message handler (catch any text)
-# -----------------------------
 @dp.message(AnyTextFilter())
 async def handle_any_text(message: Message):
     text = (message.text or "").strip()
 
-    # Accept /bypass <url> explicitly too
+    # accept /bypass <url>
     if text.lower().startswith("/bypass"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Usage: /bypass <gplinks_url>  — or reply to a message with the command.")
+            await message.reply("Usage: /bypass <gplinks_url>")
             return
         target = extract_url_from_text(parts[1]) or parts[1].strip()
     else:
-        # if replying to a message, prefer the replied message's text
         if message.reply_to_message and message.reply_to_message.text:
             target = extract_url_from_text(message.reply_to_message.text) or extract_url_from_text(text)
         else:
             target = extract_url_from_text(text)
 
     if not target:
-        # respond help for greetings or /start
-        if text.lower().startswith("/start") or text.lower().startswith("hi") or text.lower().startswith("hello"):
+        # ignore non-gplinks text to avoid spam
+        # reply to greetings to help usability
+        if text.lower().startswith("hi") or text.lower().startswith("hello"):
             await cmd_start(message)
         return
 
-    # start (editable) progress message
     progress_msg: Optional[Message] = None
-    if LOG_TO_TELEGRAM:
-        progress_msg = await send_progress(chat_id=message.chat.id, text="⏳ Starting bypass (with retries)...", reply_to_message_id=message.message_id)
+    if True:
+        progress_msg = await send_progress(chat_id=message.chat.id, text="⏳ Starting bypass...", reply_to_message_id=message.message_id)
 
     async def progress_cb(txt: str):
         nonlocal progress_msg
         logger.info("Progress: %s", txt)
-        if LOG_TO_TELEGRAM:
-            progress_msg = await send_progress(chat_id=message.chat.id, text=txt, edit_message=progress_msg)
+        progress_msg = await send_progress(chat_id=message.chat.id, text=txt, edit_message=progress_msg)
 
     try:
-        if LOG_TO_TELEGRAM:
-            await progress_cb(f"Processing: {target}")
-
+        await progress_cb(f"Processing: {target}")
         result = await bypass_gplinks(target, progress_callback=progress_cb)
-
         final = result.get("final_url")
         captcha = result.get("captcha_detected", False)
         screenshot = result.get("screenshot")
 
-        if LOG_TO_TELEGRAM:
-            await progress_cb("Bypass finished — preparing results...")
+        await progress_cb("Bypass finished — preparing results...")
 
         if captcha:
-            await message.reply("⚠️ CAPTCHA detected. I couldn't solve it automatically. See screenshot below for manual review.")
+            await message.reply("⚠️ CAPTCHA detected — I cannot solve it automatically. Screenshot below for manual review.")
             if screenshot and os.path.exists(screenshot):
-                await bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(screenshot), caption="Screenshot (CAPTCHA page)")
+                await bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(screenshot), caption="CAPTCHA screenshot")
             else:
                 await message.reply("Could not capture screenshot.")
-            await message.reply(f"Partial URL observed: {result.get('raw_last_page_url')}")
+            await message.reply(f"Partial page URL: {result.get('raw_last_page_url')}")
             return
 
         await message.reply(f"✅ Final URL (best-effort):\n{final}")
-
         if screenshot and os.path.exists(screenshot):
             await bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(screenshot), caption="Debug screenshot")
 
-    except Exception as e:
+    except Exception as exc:
         logger.exception("Error during bypass flow")
+        # notify admin (optional)
+        if ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"Bot error: {exc}")
+            except Exception:
+                pass
+        await message.reply(f"⚠️ Error while bypassing: {exc}")
+
+
+# -----------------------------
+# Startup & main
+# -----------------------------
+async def on_startup_notify():
+    msg = "Bot started and polling for messages."
+    logger.info(msg)
+    if ADMIN_CHAT_ID:
         try:
-            # attempt to send last attempt screenshot if exists
-            if os.path.exists(SCREENSHOT_PATH_TEMPLATE.format(attempt=attempts)):
-                await bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(SCREENSHOT_PATH_TEMPLATE.format(attempt=attempts)), caption="Error screenshot")
+            await bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=msg)
         except Exception:
-            pass
-        await message.reply(f"⚠️ Error while bypassing: {e}")
+            logger.exception("Failed to notify admin on startup")
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    await on_startup_notify()
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        logger.exception("Fatal error in main loop")
