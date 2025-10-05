@@ -1,6 +1,4 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
 playwright
-jinja2
-python-multipart
+pydantic
