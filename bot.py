@@ -1,117 +1,4 @@
-# web_bypass.py
-# FastAPI web service to bypass shortlinks (gplinks, get2.in, etc.)
-# Usage: uvicorn web_bypass:app --host 0.0.0.0 --port 8000
-
-import asyncio
-import base64
-import logging
-import re
-import time
-from io import BytesIO
-from typing import Optional
-from urllib.parse import urljoin, urlparse, unquote
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, AnyHttpUrl
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("web-bypass")
-
-app = FastAPI(title="GPLinks Bypass Service")
-
-# ---- Config ----
-DEFAULT_HEADLESS = True
-NAV_TIMEOUT = 60_000         # ms
-CLICK_TIMEOUT = 12_000       # ms
-MAX_TOTAL_WAIT = 60         # seconds per attempt
-ATTEMPT_COUNT = 3
-TAKE_SCREENSHOT = True      # default include screenshot
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
-
-# ---- Request / Response models ----
-class BypassRequest(BaseModel):
-    url: AnyHttpUrl
-    headless: Optional[bool] = DEFAULT_HEADLESS
-    attempts: Optional[int] = ATTEMPT_COUNT
-    include_screenshot: Optional[bool] = True
-
-class BypassResponse(BaseModel):
-    final_url: str
-    raw_last_url: str
-    captcha_detected: bool
-    screenshot_b64: Optional[str] = None
-    attempts_made: int
-
-# ---- Helpers ----
-def looks_final(u: Optional[str]) -> bool:
-    if not u:
-        return False
-    u = u.lower()
-    return ("gplinks.co" not in u) and ("gplinks" not in u)
-
-def try_decode_get2_in(url: str) -> Optional[str]:
-    """
-    Some get2.in links have an encoded target after '?' e.g. get2.in/?<encoded>
-    Try to decode that (base64 urlsafe or plain URL-encoded).
-    """
-    try:
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        if "get2.in" not in host:
-            return None
-        query = parsed.query or parsed.path.split("?", 1)[-1]  # fallback
-        if not query:
-            return None
-        # if query is of form k=v, try typical query parsing (but many get2.in use raw value)
-        if "=" in query:
-            # try to find a value that looks like base64
-            parts = query.split("&")
-            candidate = None
-            for p in parts:
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    if len(v) > 8:
-                        candidate = v
-                        break
-            if not candidate:
-                candidate = parts[-1].split("=", 1)[-1]
-        else:
-            candidate = query
-
-        # try URL-unquote first
-        cand = unquote(candidate)
-        # try base64 urlsafe decode (with padding)
-        try:
-            b = cand.encode()
-            # add padding if needed
-            padding = 4 - (len(b) % 4)
-            if padding and padding < 4:
-                b += b"=" * padding
-            decoded = base64.urlsafe_b64decode(b).decode(errors="ignore")
-            # if looks like a URL, return it
-            if decoded.startswith("http"):
-                return decoded
-        except Exception:
-            pass
-
-        # fallback: if cand itself looks like a url
-        if cand.startswith("http"):
-            return cand
-
-    except Exception:
-        logger.exception("decode get2.in failed")
-    return None
-
-async def take_screenshot_base64(page: Page) -> str:
-    buf = await page.screenshot(full_page=True)
-    b64 = base64.b64encode(buf).decode()
-    return b64
-
-# ---- Core bypass logic ----
-async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logger=None):
-    """
-    Attempts once to follow redirects and clicks. Returns dict with final_url, raw_last_url, captcha_detected, screenshot_b64 (maybe).
+redirects and clicks. Returns dict with final_url, raw_last_url, captcha_detected, screenshot_b64 (maybe).
     """
     result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
     screenshot_b64 = None
@@ -200,19 +87,207 @@ async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logge
                     if el:
                         try:
                             await el.click(timeout=CLICK_TIMEOUT)
-                            await page.wait_for_timeout(1200)
+                            awai# web_bypass.py
+"""
+FastAPI web service to bypass shortlinks (gplinks.co, get2.in, etc.)
+POST /bypass  -> JSON { "url": "...", "headless": true, "attempts": 3, "include_screenshot": true }
+Optional API key: set env API_KEY; client must send header "x-api-key".
+"""
+
+import asyncio
+import base64
+import logging
+import re
+import time
+from io import BytesIO
+from typing import Optional
+from urllib.parse import urljoin, urlparse, unquote
+
+from fastapi import FastAPI, HTTPException, Header, Request
+from pydantic import BaseModel, AnyHttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("web-bypass")
+
+app = FastAPI(title="GPLinks Bypass Service")
+
+# === Config (tweak if needed) ===
+DEFAULT_HEADLESS = True
+NAV_TIMEOUT = 60_000         # ms
+CLICK_TIMEOUT = 12_000       # ms
+MAX_TOTAL_WAIT = 60          # seconds per attempt
+DEFAULT_ATTEMPTS = 3
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+
+# optional API key (set as Railway/GitHub env var API_KEY)
+API_KEY = None
+try:
+    import os
+    API_KEY = os.environ.get("API_KEY")
+except Exception:
+    API_KEY = None
+
+# === Request / Response models ===
+class BypassRequest(BaseModel):
+    url: AnyHttpUrl
+    headless: Optional[bool] = DEFAULT_HEADLESS
+    attempts: Optional[int] = DEFAULT_ATTEMPTS
+    include_screenshot: Optional[bool] = True
+
+class BypassResponse(BaseModel):
+    final_url: str
+    raw_last_url: str
+    captcha_detected: bool
+    screenshot_b64: Optional[str] = None
+    attempts_made: int
+
+# === Helpers ===
+def looks_final(u: Optional[str]) -> bool:
+    if not u:
+        return False
+    u_l = u.lower()
+    return ("gplinks.co" not in u_l) and ("gplinks" not in u_l)
+
+def try_decode_get2_in(url: str) -> Optional[str]:
+    """
+    decode get2.in style encoded targets (base64/url-encoded). Returns decoded URL or None.
+    """
+    try:
+        parsed = urlparse(url)
+        if "get2.in" not in parsed.netloc.lower():
+            return None
+        query = parsed.query or parsed.path.split("?", 1)[-1]
+        if not query:
+            return None
+        # try raw query parts
+        candidate = None
+        if "=" in query:
+            parts = query.split("&")
+            # take first v-like value that is long
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    if len(v) > 8:
+                        candidate = v
+                        break
+            if not candidate:
+                candidate = parts[-1].split("=", 1)[-1]
+        else:
+            candidate = query
+        if not candidate:
+            return None
+        cand = unquote(candidate)
+        # try base64 urlsafe
+        try:
+            b = cand.encode("utf-8")
+            padding = (-len(b)) % 4
+            if padding:
+                b += b"=" * padding
+            decoded = base64.urlsafe_b64decode(b).decode(errors="ignore")
+            if decoded.startswith("http"):
+                return decoded
+        except Exception:
+            pass
+        # fallback: if cand itself looks like URL
+        if cand.startswith("http"):
+            return cand
+    except Exception:
+        logger.exception("decode get2.in failed")
+    return None
+
+async def take_screenshot_b64(page: Page) -> str:
+    b = await page.screenshot(full_page=True)
+    return base64.b64encode(b).decode()
+
+# === Core bypass attempt ===
+async def bypass_once(page: Page, url: str, attempt_num: int, progress_logger=None):
+    result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
+    try:
+        if progress_logger:
+            progress_logger(f"[attempt {attempt_num}] goto {url}")
+        try:
+            await page.goto(url, timeout=NAV_TIMEOUT)
+        except PlaywrightTimeoutError:
+            logger.warning("page.goto timeout on attempt %s", attempt_num)
+        except Exception:
+            logger.exception("page.goto error attempt %s", attempt_num)
+
+        # try early button click (common on gplinks)
+        try:
+            btn = await page.wait_for_selector("a#btn-main, button#btn-main, a[role='button']", timeout=15000)
+            if btn:
+                try:
+                    if progress_logger:
+                        progress_logger(f"[attempt {attempt_num}] found redirect button; clicking")
+                    await btn.click(timeout=CLICK_TIMEOUT)
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    logger.debug("redirect button click failed")
+        except Exception:
+            pass
+
+        start = time.time()
+        last_url = page.url
+        while time.time() - start < MAX_TOTAL_WAIT:
+            current_url = page.url
+            result["raw_last_url"] = current_url
+
+            # try decode get2.in quickly
+            decoded = try_decode_get2_in(current_url)
+            if decoded:
+                result["final_url"] = decoded
+                try:
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                except Exception:
+                    pass
+                return result
+
+            if looks_final(current_url) and current_url != url:
+                result["final_url"] = current_url
+                try:
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                except Exception:
+                    pass
+                return result
+
+            # detect captcha-like content
+            try:
+                content = await page.content()
+            except Exception:
+                content = ""
+            if any(k in content.lower() for k in ("captcha", "recaptcha", "hcaptcha", "i am not a robot", "please verify")):
+                result["captcha_detected"] = True
+                try:
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                except Exception:
+                    pass
+                return result
+
+            # try clicking common selectors
+            selectors = [
+                "a#btn-main", "a[href*='redirect']", "a[href*='http']",
+                "a.btn", "button#btn-main", "button", "input[type=submit]", "a[role='button']"
+            ]
+            for sel in selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        try:
+                            await el.click(timeout=CLICK_TIMEOUT)
+                            await page.wait_for_timeout(1000)
                         except Exception:
                             pass
                 except Exception:
                     pass
 
-            # wait for networkidle
+            # wait briefly for network changes
             try:
-                await page.wait_for_load_state("networkidle", timeout=3000)
+                await page.wait_for_load_state("networkidle", timeout=2000)
             except Exception:
                 pass
 
-            # sniff meta refresh
+            # sniff meta refresh or JS redirect in page content
             try:
                 m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']?([^"\']+)["\']?', content, re.IGNORECASE)
                 if m:
@@ -227,7 +302,6 @@ async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logge
             except Exception:
                 pass
 
-            # js redirect sniff
             try:
                 js_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
                 if js_match:
@@ -240,31 +314,26 @@ async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logge
             except Exception:
                 pass
 
-            # find external anchors and try navigate
+            # anchors -> follow external anchors as best-effort
             try:
                 anchors = await page.query_selector_all("a")
                 for a in anchors:
                     try:
                         href = await a.get_attribute("href")
-                        if not href:
-                            continue
-                        if href.startswith("javascript:") or href.startswith("#"):
+                        if not href or href.startswith("javascript:") or href.startswith("#"):
                             continue
                         full = urljoin(page.url, href)
-                        # if external (not same short domain) consider it final
                         if looks_final(full):
                             try:
                                 await page.goto(full, timeout=15000)
                                 if looks_final(page.url):
                                     result["final_url"] = page.url
                                     try:
-                                        screenshot_b64 = await take_screenshot_base64(page)
-                                        result["screenshot_b64"] = screenshot_b64
+                                        result["screenshot_b64"] = await take_screenshot_b64(page)
                                     except Exception:
                                         pass
                                     return result
                             except Exception:
-                                # fallback: return the external href
                                 result["final_url"] = full
                                 return result
                     except Exception:
@@ -276,66 +345,66 @@ async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logge
                 last_url = page.url
             await page.wait_for_timeout(1000)
 
-        # timeout reached - best effort
+        # timeout reached - best-effort
         result["final_url"] = page.url
         try:
-            screenshot_b64 = await take_screenshot_base64(page)
-            result["screenshot_b64"] = screenshot_b64
+            result["screenshot_b64"] = await take_screenshot_b64(page)
         except Exception:
             pass
         return result
 
     except Exception:
-        logger.exception("Error in bypass attempt")
+        logger.exception("Error in bypass_once")
         return result
 
-# ---- HTTP endpoint ----
+# === Endpoint ===
 @app.post("/bypass", response_model=BypassResponse)
-async def bypass_endpoint(req: BypassRequest):
+async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(None)):
+    # API key check (optional)
+    if API_KEY:
+        if not x_api_key or x_api_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Missing/invalid API key")
+
     url = str(req.url)
-    attempts = max(1, min(10, int(req.attempts or ATTEMPT_COUNT)))
+    attempts = max(1, min(10, int(req.attempts or DEFAULT_ATTEMPTS)))
     headless = bool(req.headless)
     include_screenshot = bool(req.include_screenshot)
 
-    # basic safety: only allow http(s)
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Unsupported URL scheme")
 
-    logger.info("Received bypass request for %s (attempts=%s headless=%s)", url, attempts, headless)
+    logger.info("Bypass request: url=%s attempts=%s headless=%s", url, attempts, headless)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        browser = await p.chromium.launch(headless=headless, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context(user_agent=USER_AGENT)
         page = await context.new_page()
 
-        final_result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
+        final = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
         attempt_made = 0
         try:
             for i in range(1, attempts + 1):
                 attempt_made = i
-                # try some human-like tiny actions (non-blocking)
+                # tiny human-like action
                 try:
-                    # small mouse move to avoid super-headless
                     await page.mouse.move(100, 100)
                 except Exception:
                     pass
 
-                res = await bypass_url_once(page, url, i, progress_logger=lambda t: logger.info("BYPASS: %s", t))
-                final_result.update(res)
-                # if captcha or final, stop
+                res = await bypass_once(page, url, i, progress_logger=lambda t: logger.info("BYPASS: %s", t))
+                final.update(res)
                 if res.get("captcha_detected") or looks_final(res.get("final_url")):
                     break
-                # else wait/backoff and try again
+
                 if i < attempts:
-                    backoff = (2 ** i) + (0.5 * i)
+                    backoff = (2 ** i) + 0.5 * i
                     logger.info("Waiting %.1fs before retry %d", backoff, i + 1)
                     await page.wait_for_timeout(int(backoff * 1000))
                     try:
                         await page.reload(timeout=5000)
                     except Exception:
                         pass
-
         finally:
             try:
                 await context.close()
@@ -347,130 +416,21 @@ async def bypass_endpoint(req: BypassRequest):
                 pass
 
         # prepare response
-        b64 = final_result.get("screenshot_b64")
+        b64 = final.get("screenshot_b64")
         if b64 and not include_screenshot:
-            final_result["screenshot_b64"] = None
+            b64 = None
 
         return BypassResponse(
-            final_url=final_result.get("final_url") or url,
-            raw_last_url=final_result.get("raw_last_url") or url,
-            captcha_detected=bool(final_result.get("captcha_detected")),
-            screenshot_b64=final_result.get("screenshot_b64"),
-            attempts_made=attempt_made,
-        )CONFIG = {
-    "HEADLESS": True,
-    "RETRY_ATTEMPTS": 4,
-    "SIMULATE_MOUSE": True,
-}
+            final_url = final.get("final_url") or url,
+            raw_last_url = final.get("raw_last_url") or url,
+            captcha_detected = bool(final.get("captcha_detected")),
+            screenshot_b64 = b64,
+            attempts_made = attempt_made,
+        )
 
-# tuning (can be changed in code)
-BASE_NAV_TIMEOUT = 60_000
-BASE_CLICK_TIMEOUT = 12_000
-MAX_TOTAL_WAIT = 60  # seconds per attempt
-SCREENSHOT_DIR = "/tmp"
-SCREENSHOT_PATH_TEMPLATE = os.path.join(SCREENSHOT_DIR, "gplinks_debug_attempt_{attempt}.png")
-
-# human-like sim
-MOUSE_MOVES_PER_ATTEMPT = 12
-CLICK_PROBABILITY = 0.6
-
-# logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("gplinks-bot")
-
-# aiogram setup
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-
-
-# -----------------------------
-# Filters / Utilities
-# -----------------------------
-class AnyTextFilter(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return bool(message.text)
-
-
-def extract_url_from_text(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    # permissive capture of gplinks URL (with or without scheme)
-    m = re.search(r'(https?://)?(?:www\.)?gplinks\.co/[^\s)]+', text, re.IGNORECASE)
-    if not m:
-        return None
-    found = m.group(0)
-    if not found.lower().startswith("http"):
-        found = "https://" + found
-    return found
-
-
-async def send_progress(chat_id: int, text: str, edit_message: Optional[Message] = None, reply_to_message_id: Optional[int] = None) -> Optional[Message]:
-    try:
-        if edit_message:
-            return await edit_message.edit_text(text)
-        else:
-            return await bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
-    except Exception:
-        logger.exception("Failed to send/edit progress message")
-        return None
-
-
-# -----------------------------
-# Playwright helper: small human-like interactions
-# -----------------------------
-async def do_human_like_actions(page, attempt_num: int):
-    try:
-        viewport = page.viewport_size or {"width": 1280, "height": 720}
-        w = viewport.get("width", 1280)
-        h = viewport.get("height", 720)
-
-        if random.random() < 0.6:
-            y_scroll = random.randint(0, max(0, h // 6))
-            try:
-                await page.mouse.wheel(0, y_scroll)
-                await page.wait_for_timeout(random.randint(250, 700))
-            except Exception:
-                pass
-
-        moves = MOUSE_MOVES_PER_ATTEMPT + int(attempt_num)
-        for _ in range(moves):
-            x = random.randint(int(w * 0.1), int(w * 0.9))
-            y = random.randint(int(h * 0.1), int(h * 0.9))
-            try:
-                await page.mouse.move(x, y, steps=random.randint(5, 20))
-            except Exception:
-                pass
-            await page.wait_for_timeout(random.randint(60, 260))
-
-        if random.random() < CLICK_PROBABILITY:
-            try:
-                cx = w // 2 + random.randint(-150, 150)
-                cy = h // 2 + random.randint(-150, 150)
-                await page.mouse.click(cx, cy)
-                await page.wait_for_timeout(random.randint(120, 700))
-            except Exception:
-                pass
-
-    except Exception:
-        logger.exception("Human-like actions failed (non-fatal)")
-
-
-# -----------------------------
-# Single attempt - improved with explicit button click and screenshots
-# -----------------------------
-async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: int, attempt: int, progress_callback=None) -> dict:
-    result = {"final_url": url, "screenshot": None, "captcha_detected": False, "raw_last_page_url": url}
-    screenshot_path = SCREENSHOT_PATH_TEMPLATE.format(attempt=attempt)
-
-    try:
-        if progress_callback:
-            await progress_callback(f"[Attempt {attempt}] Navigating to {url} ...")
-
-        try:
-            await page.goto(url, timeout=nav_timeout)
-        except PlaywrightTimeoutError:
-            logger.warning("Navigation timed out on attempt %d", attempt)
-        except Exception:
+@app.get("/health")
+async def health():
+    return {"status": "ok"}tion:
             logger.exception("Navigation error on attempt %d", attempt)
 
         # try explicit button click(s) often present on GPLinks
@@ -830,3 +790,4 @@ if __name__ == "__main__":
     except Exception:
 
         logger.exception("Fatal error in main loop")
+
