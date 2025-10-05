@@ -1,4 +1,4 @@
-aiogram>=3.7.0,<4.0.0
+fastapi>=0.95.0
+uvicorn[standard]>=0.20.0
 playwright>=1.35.0
-Pillow>=10.0.0
-typing-extensions>=4.7.1
+pydantic>=1.10.0
