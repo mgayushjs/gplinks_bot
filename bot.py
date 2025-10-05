@@ -1,40 +1,363 @@
-# bot.py
-"""
-GPLinks bypass bot - aiogram 3.7+ + Playwright
-Save as bot.py. Set only BOT_TOKEN (and optionally ADMIN_CHAT_ID) in Railway environment.
-"""
+# web_bypass.py
+# FastAPI web service to bypass shortlinks (gplinks, get2.in, etc.)
+# Usage: uvicorn web_bypass:app --host 0.0.0.0 --port 8000
 
 import asyncio
-import os
-import re
+import base64
 import logging
+import re
 import time
-import random
+from io import BytesIO
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 
-from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
-from aiogram.types import Message, FSInputFile
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, BaseFilter
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, AnyHttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
 
-# -----------------------------
-# Required env vars
-# -----------------------------
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("BOT_TOKEN environment variable must be set")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("web-bypass")
 
-# Optional admin chat id (useful for debugging)
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # string or None
+app = FastAPI(title="GPLinks Bypass Service")
 
-# -----------------------------
-# Runtime-configurable defaults
-# -----------------------------
-CONFIG = {
+# ---- Config ----
+DEFAULT_HEADLESS = True
+NAV_TIMEOUT = 60_000         # ms
+CLICK_TIMEOUT = 12_000       # ms
+MAX_TOTAL_WAIT = 60         # seconds per attempt
+ATTEMPT_COUNT = 3
+TAKE_SCREENSHOT = True      # default include screenshot
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+
+# ---- Request / Response models ----
+class BypassRequest(BaseModel):
+    url: AnyHttpUrl
+    headless: Optional[bool] = DEFAULT_HEADLESS
+    attempts: Optional[int] = ATTEMPT_COUNT
+    include_screenshot: Optional[bool] = True
+
+class BypassResponse(BaseModel):
+    final_url: str
+    raw_last_url: str
+    captcha_detected: bool
+    screenshot_b64: Optional[str] = None
+    attempts_made: int
+
+# ---- Helpers ----
+def looks_final(u: Optional[str]) -> bool:
+    if not u:
+        return False
+    u = u.lower()
+    return ("gplinks.co" not in u) and ("gplinks" not in u)
+
+def try_decode_get2_in(url: str) -> Optional[str]:
+    """
+    Some get2.in links have an encoded target after '?' e.g. get2.in/?<encoded>
+    Try to decode that (base64 urlsafe or plain URL-encoded).
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if "get2.in" not in host:
+            return None
+        query = parsed.query or parsed.path.split("?", 1)[-1]  # fallback
+        if not query:
+            return None
+        # if query is of form k=v, try typical query parsing (but many get2.in use raw value)
+        if "=" in query:
+            # try to find a value that looks like base64
+            parts = query.split("&")
+            candidate = None
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    if len(v) > 8:
+                        candidate = v
+                        break
+            if not candidate:
+                candidate = parts[-1].split("=", 1)[-1]
+        else:
+            candidate = query
+
+        # try URL-unquote first
+        cand = unquote(candidate)
+        # try base64 urlsafe decode (with padding)
+        try:
+            b = cand.encode()
+            # add padding if needed
+            padding = 4 - (len(b) % 4)
+            if padding and padding < 4:
+                b += b"=" * padding
+            decoded = base64.urlsafe_b64decode(b).decode(errors="ignore")
+            # if looks like a URL, return it
+            if decoded.startswith("http"):
+                return decoded
+        except Exception:
+            pass
+
+        # fallback: if cand itself looks like a url
+        if cand.startswith("http"):
+            return cand
+
+    except Exception:
+        logger.exception("decode get2.in failed")
+    return None
+
+async def take_screenshot_base64(page: Page) -> str:
+    buf = await page.screenshot(full_page=True)
+    b64 = base64.b64encode(buf).decode()
+    return b64
+
+# ---- Core bypass logic ----
+async def bypass_url_once(page: Page, url: str, attempt_num: int, progress_logger=None):
+    """
+    Attempts once to follow redirects and clicks. Returns dict with final_url, raw_last_url, captcha_detected, screenshot_b64 (maybe).
+    """
+    result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
+    screenshot_b64 = None
+    screenshot_info = f"attempt_{attempt_num}.png"
+
+    try:
+        if progress_logger:
+            progress_logger(f"[attempt {attempt_num}] goto {url}")
+        try:
+            await page.goto(url, timeout=NAV_TIMEOUT)
+        except PlaywrightTimeoutError:
+            logger.warning("page.goto timeout attempt %s", attempt_num)
+        except Exception:
+            logger.exception("page.goto error attempt %s", attempt_num)
+
+        # explicit click on common redirect buttons early
+        try:
+            btn = await page.wait_for_selector("a#btn-main, button#btn-main, a[role='button'], a.btn", timeout=20000)
+            if btn:
+                try:
+                    if progress_logger:
+                        progress_logger(f"[attempt {attempt_num}] found redirect button - clicking")
+                    await btn.click(timeout=CLICK_TIMEOUT)
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    logger.debug("button click failed")
+        except Exception:
+            # no button found early - continue
+            pass
+
+        start = time.time()
+        last_url = page.url
+
+        while time.time() - start < MAX_TOTAL_WAIT:
+            current_url = page.url
+            result["raw_last_url"] = current_url
+
+            # if host is get2.in try decode quickly
+            decoded = try_decode_get2_in(current_url)
+            if decoded:
+                result["final_url"] = decoded
+                if progress_logger:
+                    progress_logger(f"[attempt {attempt_num}] decoded get2.in -> {decoded}")
+                # optional screenshot
+                try:
+                    screenshot_b64 = await take_screenshot_base64(page)
+                    result["screenshot_b64"] = screenshot_b64
+                except Exception:
+                    pass
+                return result
+
+            if looks_final(current_url) and current_url != url:
+                result["final_url"] = current_url
+                try:
+                    screenshot_b64 = await take_screenshot_base64(page)
+                    result["screenshot_b64"] = screenshot_b64
+                    result["raw_last_url"] = current_url
+                except Exception:
+                    pass
+                return result
+
+            # check content for captcha
+            content = ""
+            try:
+                content = await page.content()
+            except Exception:
+                content = ""
+
+            if any(k in content.lower() for k in ("captcha", "recaptcha", "hcaptcha", "i am not a robot", "please verify")):
+                result["captcha_detected"] = True
+                try:
+                    screenshot_b64 = await take_screenshot_base64(page)
+                    result["screenshot_b64"] = screenshot_b64
+                except Exception:
+                    pass
+                return result
+
+            # try clicking known selectors
+            selectors = [
+                "a#btn-main", "a[href*='redirect']", "a[href*='http']",
+                "a.btn", "button#btn-main", "button", "input[type=submit]", "a[role='button']"
+            ]
+            for sel in selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        try:
+                            await el.click(timeout=CLICK_TIMEOUT)
+                            await page.wait_for_timeout(1200)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # wait for networkidle
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+
+            # sniff meta refresh
+            try:
+                m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']?([^"\']+)["\']?', content, re.IGNORECASE)
+                if m:
+                    mm = re.search(r'url=([^;\'"]+)', m.group(1), re.IGNORECASE)
+                    if mm:
+                        target = urljoin(page.url, mm.group(1).strip())
+                        try:
+                            await page.goto(target, timeout=15000)
+                            continue
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # js redirect sniff
+            try:
+                js_match = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
+                if js_match:
+                    target = urljoin(page.url, js_match.group(1).strip())
+                    try:
+                        await page.goto(target, timeout=15000)
+                        continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # find external anchors and try navigate
+            try:
+                anchors = await page.query_selector_all("a")
+                for a in anchors:
+                    try:
+                        href = await a.get_attribute("href")
+                        if not href:
+                            continue
+                        if href.startswith("javascript:") or href.startswith("#"):
+                            continue
+                        full = urljoin(page.url, href)
+                        # if external (not same short domain) consider it final
+                        if looks_final(full):
+                            try:
+                                await page.goto(full, timeout=15000)
+                                if looks_final(page.url):
+                                    result["final_url"] = page.url
+                                    try:
+                                        screenshot_b64 = await take_screenshot_base64(page)
+                                        result["screenshot_b64"] = screenshot_b64
+                                    except Exception:
+                                        pass
+                                    return result
+                            except Exception:
+                                # fallback: return the external href
+                                result["final_url"] = full
+                                return result
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if page.url != last_url:
+                last_url = page.url
+            await page.wait_for_timeout(1000)
+
+        # timeout reached - best effort
+        result["final_url"] = page.url
+        try:
+            screenshot_b64 = await take_screenshot_base64(page)
+            result["screenshot_b64"] = screenshot_b64
+        except Exception:
+            pass
+        return result
+
+    except Exception:
+        logger.exception("Error in bypass attempt")
+        return result
+
+# ---- HTTP endpoint ----
+@app.post("/bypass", response_model=BypassResponse)
+async def bypass_endpoint(req: BypassRequest):
+    url = str(req.url)
+    attempts = max(1, min(10, int(req.attempts or ATTEMPT_COUNT)))
+    headless = bool(req.headless)
+    include_screenshot = bool(req.include_screenshot)
+
+    # basic safety: only allow http(s)
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Unsupported URL scheme")
+
+    logger.info("Received bypass request for %s (attempts=%s headless=%s)", url, attempts, headless)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(user_agent=USER_AGENT)
+        page = await context.new_page()
+
+        final_result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
+        attempt_made = 0
+        try:
+            for i in range(1, attempts + 1):
+                attempt_made = i
+                # try some human-like tiny actions (non-blocking)
+                try:
+                    # small mouse move to avoid super-headless
+                    await page.mouse.move(100, 100)
+                except Exception:
+                    pass
+
+                res = await bypass_url_once(page, url, i, progress_logger=lambda t: logger.info("BYPASS: %s", t))
+                final_result.update(res)
+                # if captcha or final, stop
+                if res.get("captcha_detected") or looks_final(res.get("final_url")):
+                    break
+                # else wait/backoff and try again
+                if i < attempts:
+                    backoff = (2 ** i) + (0.5 * i)
+                    logger.info("Waiting %.1fs before retry %d", backoff, i + 1)
+                    await page.wait_for_timeout(int(backoff * 1000))
+                    try:
+                        await page.reload(timeout=5000)
+                    except Exception:
+                        pass
+
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+        # prepare response
+        b64 = final_result.get("screenshot_b64")
+        if b64 and not include_screenshot:
+            final_result["screenshot_b64"] = None
+
+        return BypassResponse(
+            final_url=final_result.get("final_url") or url,
+            raw_last_url=final_result.get("raw_last_url") or url,
+            captcha_detected=bool(final_result.get("captcha_detected")),
+            screenshot_b64=final_result.get("screenshot_b64"),
+            attempts_made=attempt_made,
+        )CONFIG = {
     "HEADLESS": True,
     "RETRY_ATTEMPTS": 4,
     "SIMULATE_MOUSE": True,
@@ -505,4 +828,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception:
+
         logger.exception("Fatal error in main loop")
