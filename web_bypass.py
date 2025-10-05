@@ -442,53 +442,54 @@ async def health():
     return {"status": "ok"}
 
 # === Web UI ===
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>GPLinks Bypass</title>
-        <meta charset="utf-8" />
-        <style>
-            body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; padding:20px; max-width:900px;margin:auto;}
-            input[type=text]{width:70%; padding:8px; margin-right:8px;}
-            button{padding:8px 12px;}
-            #spinner{display:none;margin-top:10px;}
-            pre{background:#f7f7f8;padding:12px;border-radius:6px; white-space:pre-wrap;}
-            .small{font-size:0.9rem;color:#666;}
-        </style>
-    </head>
-    <body>
-        <h1>GPLinks Bypass Service</h1>
-        <p class="small">Paste a GPLinks URL and click <strong>Start</strong>. Optional: include a debug screenshot.</p>
-        <input type="text" id="gplink" placeholder="https://gplinks.co/..." />
-        <label><input type="checkbox" id="screenshot" /> Include Screenshot</label>
-        <button onclick="startBypass()">Start</button>
-        <div id="spinner">⏳ Bypassing — this may take a few seconds...</div>
-        <div id="output" style="margin-top:12px;"></div>
 
-        <script>
-        async function startBypass(){
-            const url = document.getElementById('gplink').value.trim();
-            const include_screenshot = document.getElementById('screenshot').checked;
-            if(!url){ alert("Please enter a GPLinks URL."); return; }
-            document.getElementById('spinner').style.display = 'block';
-            document.getElementById('output').innerHTML = '';
-            try{
-                const res = await fetch("/bypass", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ url: url, include_screenshot: include_screenshot, attempts: 3 })
-                });
-                if(!res.ok){
-                    const err = await res.json().catch(()=>({detail:res.statusText}));
-                    document.getElementById('output').innerText = "Error: " + (err.detail || JSON.stringify(err));
-                    return;
-                }
-                const data = await res.json();
-                let html = `<pre>✅ Final URL: ${data.final_url}\nAttempts Made: ${data.attempts_made}\nCaptcha Detected: ${data.captcha_detected}\nRaw Last URL: ${data.raw_last_url}</pre>`;
-                if(data.screenshot_b64){
-                    html += `<p><a href="data:image/png;base64,${data.screenshot_b64}" download="screenshot.png">Download debug screenshot</a></p>`;
-                    html += `<p><img src="data:image/png;base64,${data.screenshot_b64}" style="max-width:100%; border:1px solid #ddd;"/></p>`;
- 
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPLinks Bypass</title>
+<style>
+body { font-family: Arial, sans-serif; background: #f2f2f2; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+.container { background:#fff; padding:30px; border-radius:10px; box-shadow:0 0 15px rgba(0,0,0,0.1); max-width:400px; width:100%; }
+input[type=text] { width:100%; padding:10px; margin:10px 0; border-radius:5px; border:1px solid #ccc; }
+button { padding:10px 20px; background:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer; }
+button:hover { background:#45a049; }
+.result { margin-top:15px; word-break:break-all; }
+</style>
+</head>
+<body>
+<div class="container">
+<h2>GPLinks Bypass</h2>
+<input type="text" id="url" placeholder="Enter GPLinks URL">
+<button onclick="startBypass()">Start</button>
+<div class="result" id="result"></div>
+</div>
+<script>
+async function startBypass() {
+    const url = document.getElementById('url').value;
+    if(!url) { alert('Please enter a URL'); return; }
+    document.getElementById('result').innerText = '⏳ Bypassing...';
+    try {
+        const res = await fetch('/bypass', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({url:url, headless:true, include_screenshot:false, attempts:3})
+        });
+        const data = await res.json();
+        if(data.final_url) {
+            document.getElementById('result').innerHTML = `<strong>Final URL:</strong> <a href="${data.final_url}" target="_blank">${data.final_url}</a>`;
+        } else {
+            document.getElementById('result').innerText = '❌ Could not bypass URL';
+        }
+    } catch(e) {
+        document.getElementById('result').innerText = '⚠️ Error: '+e;
+    }
+}
+</script>
+</body>
+</html>
+"""
