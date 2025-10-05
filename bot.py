@@ -1,4 +1,18 @@
-# gplinks_bot_runtime_toggles.py
+# gplinks_bot_aiogram37.py
+"""
+GPLinks bypass Telegram bot
+- aiogram 3.7+ compatible (uses Command filter decorators)
+- Playwright Chromium automation
+- Retries + human-like simulation + screenshots on CAPTCHA/failure
+- Runtime toggles via Telegram commands:
+    /set_headless on|off
+    /set_retries <n>
+    /set_mouse on|off
+    /status
+    /bypass <url>  (or reply to a message containing the URL)
+Only BOT_TOKEN env var is required.
+"""
+
 import asyncio
 import os
 import re
@@ -6,12 +20,14 @@ import logging
 import time
 import random
 from urllib.parse import urljoin
+from typing import Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import Message, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # -----------------------------
@@ -22,22 +38,21 @@ if TOKEN is None:
     raise SystemExit("BOT_TOKEN environment variable must be set")
 
 # -----------------------------
-# Defaults & constants
-# -----------------------------
 # Runtime-configurable settings (only BOT_TOKEN required)
+# -----------------------------
 CONFIG = {
     "HEADLESS": True,        # True => headless; False => visible browser
     "RETRY_ATTEMPTS": 3,     # number of tries
     "SIMULATE_MOUSE": True,  # human-like interactions
 }
 
-# Non-runtime tuning constants (can be changed in code)
+# Non-runtime tuning constants (can be changed in-code)
 BASE_NAV_TIMEOUT = 60_000     # ms
 BASE_CLICK_TIMEOUT = 12_000   # ms
 MAX_TOTAL_WAIT = 30           # seconds per attempt loop
 SCREENSHOT_PATH = "/tmp/gplinks_debug.png"
-LOG_TO_TELEGRAM = True        # send progress updates to the same chat
-TELEGRAM_LOG_CHAT_ID = None   # keep None to use the invoking chat
+LOG_TO_TELEGRAM = True        # send progress updates to the invoking chat
+TELEGRAM_LOG_CHAT_ID = None   # if set, logs always go to that chat id
 
 # Retry/backoff settings
 BACKOFF_BASE = 2.0     # backoff factor
@@ -46,6 +61,9 @@ JITTER_SEC = 1.5       # jitter for backoff
 # Human-like interaction settings
 MOUSE_MOVES_PER_ATTEMPT = 6
 CLICK_PROBABILITY = 0.35
+
+# Retry attempts default (can be changed at runtime via /set_retries)
+RETRY_ATTEMPTS_DEFAULT = CONFIG["RETRY_ATTEMPTS"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,7 +78,7 @@ dp = Dispatcher(storage=MemoryStorage())
 # -----------------------------
 # Utilities: send/edit progress messages
 # -----------------------------
-async def send_progress(chat_id: int, text: str, reply_to_message_id: int | None = None, edit_message=None):
+async def send_progress(chat_id: int, text: str, reply_to_message_id: Optional[int] = None, edit_message: Optional[Message] = None) -> Optional[Message]:
     """
     Send or edit a progress message in Telegram. Returns message object (or None on failure).
     """
@@ -79,7 +97,7 @@ async def send_progress(chat_id: int, text: str, reply_to_message_id: int | None
 # -----------------------------
 async def do_human_like_actions(page, attempt_num: int):
     """
-    Small human-like mouse/scroll actions to reduce 'headless' fingerprinting.
+    Small human-like mouse/scroll actions to reduce obvious 'headless' fingerprinting.
     Non-fatal if any action fails.
     """
     try:
@@ -124,10 +142,10 @@ async def do_human_like_actions(page, attempt_num: int):
 # -----------------------------
 # Low-level single attempt
 # -----------------------------
-async def attempt_bypass_once(page, url, nav_timeout, click_timeout, progress_callback=None):
+async def attempt_bypass_once(page, url: str, nav_timeout: int, click_timeout: int, progress_callback=None) -> dict:
     """
-    Attempt single-pass bypass using selectors/sniffing. Returns a dict with:
-    { final_url, screenshot, captcha_detected, raw_last_page_url }
+    Attempt single-pass bypass using selectors/sniffing. Returns dict:
+      { final_url, screenshot, captcha_detected, raw_last_page_url }
     """
     result = {"final_url": url, "screenshot": None, "captcha_detected": False, "raw_last_page_url": url}
     try:
@@ -265,7 +283,7 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
     """
     Top-level orchestrator that runs multiple attempts and returns the best result.
     """
-    attempts = int(CONFIG.get("RETRY_ATTEMPTS", 3))
+    attempts = int(CONFIG.get("RETRY_ATTEMPTS", RETRY_ATTEMPTS_DEFAULT))
     headless = bool(CONFIG.get("HEADLESS", True))
     simulate_mouse = bool(CONFIG.get("SIMULATE_MOUSE", True))
 
@@ -343,7 +361,7 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
 # -----------------------------
 # URL extractor
 # -----------------------------
-def extract_url_from_text(text: str) -> str | None:
+def extract_url_from_text(text: str) -> Optional[str]:
     if not text:
         return None
     m = re.search(r'https?://(?:www\.)?gplinks\.co/[^\s]+', text, re.IGNORECASE)
@@ -353,17 +371,17 @@ def extract_url_from_text(text: str) -> str | None:
 # -----------------------------
 # Telegram command handlers: runtime toggles & status
 # -----------------------------
-@dp.message(commands=["set_headless"])
+@dp.message(Command("set_headless"))
 async def cmd_set_headless(message: Message):
     args = (message.text or "").split()
-    if len(args) < 2 or args[1].lower() not in ["on", "off"]:
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
         await message.reply("Usage: /set_headless on|off")
         return
     CONFIG["HEADLESS"] = args[1].lower() == "on"
     await message.reply(f"HEADLESS set to {CONFIG['HEADLESS']}. (No restart required.)")
 
 
-@dp.message(commands=["set_retries"])
+@dp.message(Command("set_retries"))
 async def cmd_set_retries(message: Message):
     args = (message.text or "").split()
     if len(args) < 2 or not args[1].isdigit():
@@ -373,17 +391,17 @@ async def cmd_set_retries(message: Message):
     await message.reply(f"RETRY_ATTEMPTS set to {CONFIG['RETRY_ATTEMPTS']}.")
 
 
-@dp.message(commands=["set_mouse"])
+@dp.message(Command("set_mouse"))
 async def cmd_set_mouse(message: Message):
     args = (message.text or "").split()
-    if len(args) < 2 or args[1].lower() not in ["on", "off"]:
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
         await message.reply("Usage: /set_mouse on|off")
         return
     CONFIG["SIMULATE_MOUSE"] = args[1].lower() == "on"
     await message.reply(f"SIMULATE_MOUSE set to {CONFIG['SIMULATE_MOUSE']}.")
 
 
-@dp.message(commands=["status"])
+@dp.message(Command("status"))
 async def cmd_status(message: Message):
     status_lines = [f"{k}: {v}" for k, v in CONFIG.items()]
     await message.reply("Current configuration:\n" + "\n".join(status_lines))
@@ -392,7 +410,7 @@ async def cmd_status(message: Message):
 # -----------------------------
 # Main message handler (accepts /bypass or raw message or replies)
 # -----------------------------
-@dp.message()
+@dp.message()  # generic message handler (no unsupported kwargs)
 async def handle_all_messages(message: Message):
     text = (message.text or "").strip()
 
@@ -404,17 +422,17 @@ async def handle_all_messages(message: Message):
             return
         target = extract_url_from_text(parts[1]) or parts[1].strip()
     else:
-        # if replying to a message, check the replied text first
+        # if replying to a message, prefer the replied message's text
         if message.reply_to_message and message.reply_to_message.text:
             target = extract_url_from_text(message.reply_to_message.text) or extract_url_from_text(text)
         else:
             target = extract_url_from_text(text)
 
     if not target:
-        return  # ignore non-bypass messages
+        return  # ignore unrelated messages
 
     # start (editable) progress message
-    progress_msg = None
+    progress_msg: Optional[Message] = None
     if LOG_TO_TELEGRAM:
         progress_msg = await send_progress(chat_id=message.chat.id, text="⏳ Starting bypass (with retries)...", reply_to_message_id=message.message_id)
 
@@ -465,6 +483,7 @@ async def handle_all_messages(message: Message):
 # Entrypoint
 # -----------------------------
 async def main():
+    # drop pending updates to avoid backlog
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
