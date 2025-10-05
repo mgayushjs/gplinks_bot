@@ -1,0 +1,19 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GPLinks Bypasser</title>
+</head>
+<body>
+    <h2>GPLinks Bypasser</h2>
+    <form action="/submit" method="post">
+        <input type="text" name="url" placeholder="Paste GPLinks URL here" style="width:300px;" required>
+        <button type="submit">Bypass</button>
+    </form>
+
+    {% if result_url %}
+        <h3>Bypassed URL:</h3>
+        <a href="{{ result_url }}" target="_blank">{{ result_url }}</a>
+    {% endif %}
+</body>
+</html>
