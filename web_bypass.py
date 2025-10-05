@@ -454,13 +454,83 @@ async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(
 # ---------- Embedded UI (no templates) ----------
 @app.get("/", response_class=HTMLResponse)
 async def ui_index(request: Request):
-    html = """
+    html = r'''
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Arolinks Bypass</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:16px;background:#f5f7fb}
     .card{max-width:900px;margin:18px auto;padding:20px;background:#fff;border-radius:10px}
-    input[type=tex
+    input[type=text]{width:68%;padding:10px;border-radius:6px;border:1px solid #ddd}
+    button{padding:10px 14px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer}
+    pre{background:#f7f8fb;padding:12px;border-radius:6px;white-space:pre-wrap}
+    img.debug{max-width:100%;margin-top:8px;border-radius:6px;border:1px solid #eee}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Arolinks Bypass</h2>
+    <p>Paste an <strong>Arolinks</strong> URL below, press Start. The service will follow timers and verification clicks and return the final destination.</p>
+    <div>
+      <input id="alink" type="text" placeholder="https://arolinks.com/..." />
+      <button onclick="startBypass()">Start</button>
+    </div>
+    <div style="margin-top:12px;">
+      <label>Attempts: <input id="attempts" type="number" value="3" min="1" max="6" style="width:72px" /></label>
+      <label style="margin-left:12px"><input id="headless" type="checkbox" checked/> Headless</label>
+      <label style="margin-left:12px"><input id="screenshot" type="checkbox" /> Include screenshot</label>
+      <label style="margin-left:12px">API Key: <input id="apikey" type="text" placeholder="(optional)" style="width:200px"/></label>
+    </div>
+    <div id="spinner" style="display:none;margin-top:12px">⏳ Bypassing — this may take up to ~90s...</div>
+    <div id="output" style="margin-top:14px"></div>
+  </div>
+
+<script>
+function escapeHtml(s){ if(!s) return ''; return s.replace(/'/g,"\\'").replace(/"/g,'\\"'); }
+
+async function startBypass(){
+  const url = document.getElementById('alink').value.trim();
+  if(!url){ alert('Please enter an Arolinks URL'); return; }
+  const attempts = parseInt(document.getElementById('attempts').value || '3', 10);
+  const headless = document.getElementById('headless').checked;
+  const include_screenshot = document.getElementById('screenshot').checked;
+  const apikey = document.getElementById('apikey').value.trim();
+
+  document.getElementById('spinner').style.display = 'block';
+  document.getElementById('output').innerHTML = '';
+
+  try{
+    const headers = {'Content-Type':'application/json'};
+    if(apikey) headers['x-api-key'] = apikey;
+    const res = await fetch('/bypass', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({ url: url, attempts: attempts, headless: headless, include_screenshot: include_screenshot })
+    });
+    if(!res.ok){
+      const err = await res.json().catch(()=>({detail:res.statusText}));
+      document.getElementById('output').innerText = 'Error: ' + (err.detail || JSON.stringify(err));
+      return;
+    }
+    const data = await res.json();
+    let html = `<pre>✅ Final URL: ${data.final_url}\nAttempts: ${data.attempts_made}\nCaptcha Detected: ${data.captcha_detected}\nRaw Last URL: ${data.raw_last_url}\nNav history: ${JSON.stringify(data.nav_history || [])}</pre>`;
+    html += `<p><button onclick="window.open('${escapeHtml(data.final_url)}','_blank')">Open final URL</button></p>`;
+    if(data.screenshot_b64){
+      html += `<p><a href="data:image/png;base64,${data.screenshot_b64}" download="screenshot.png">Download screenshot</a></p>`;
+      html += `<p><img class="debug" src="data:image/png;base64,${data.screenshot_b64}" /></p>`;
+    }
+    document.getElementById('output').innerHTML = html;
+  }catch(e){
+    document.getElementById('output').innerText = 'Error: ' + e;
+  }finally{
+    document.getElementById('spinner').style.display = 'none';
+  }
+}
+</script>
+</body>
+</html>
+'''
+    return HTMLResponse(content=html)
