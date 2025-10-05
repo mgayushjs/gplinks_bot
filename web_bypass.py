@@ -1,48 +1,50 @@
 # web_bypass.py
 """
-FastAPI web service with Heroku-target extraction for GPLinks/get2.in chains.
+GPLinks follower service.
+- Open provided GPLinks URL.
+- Follow redirects / clicks / network responses until navigation stabilizes or safety limits reached.
+- Return the last visited URL (final_url), optionally a screenshot and captcha detection.
 Endpoints:
- - GET /            -> small HTML UI (enter GPLinks URL)
- - POST /bypass     -> JSON API to bypass a link (returns final_url, screenshot etc.)
- - GET /health      -> {"status":"ok"}
-
-Optional API key: set env var API_KEY; clients must send header "x-api-key".
+  GET  /       -> simple UI
+  POST /bypass -> JSON API: { "url": "...", "attempts": 3, "headless": true, "include_screenshot": true }
+  GET  /health -> {"status":"ok"}
 """
-
-import base64
-import logging
+import os
 import re
 import time
-from typing import Optional
-from urllib.parse import urljoin, urlparse, unquote
-import os
+import base64
+import logging
+from typing import Optional, List, Set
+from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, AnyHttpUrl
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
+from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError, Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("web-bypass")
 
-app = FastAPI(title="GPLinks Bypass Service")
+app = FastAPI(title="GPLinks Follower - returns last opened link")
 
-# === Config (tweak if needed) ===
+# ====== Config ======
 DEFAULT_HEADLESS = True
-NAV_TIMEOUT = 60_000         # ms
-CLICK_TIMEOUT = 12_000       # ms
-MAX_TOTAL_WAIT = 60         # seconds per attempt
+NAV_TIMEOUT = 60_000         # ms for goto
+CLICK_TIMEOUT = 12_000       # ms for clicks
+WAIT_AFTER_OPEN = 5         # seconds to wait after opening the initial GPLinks
+MAX_TOTAL_WAIT = 90         # seconds per attempt to follow navigation
 DEFAULT_ATTEMPTS = 3
+MAX_NAV_HISTORY = 30        # safety cap for navigations
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
 API_KEY = os.environ.get("API_KEY")
 
-# === Request / Response models ===
+# ====== Request/Response models ======
 class BypassRequest(BaseModel):
     url: AnyHttpUrl
-    headless: Optional[bool] = DEFAULT_HEADLESS
     attempts: Optional[int] = DEFAULT_ATTEMPTS
-    include_screenshot: Optional[bool] = True
+    headless: Optional[bool] = DEFAULT_HEADLESS
+    include_screenshot: Optional[bool] = False
 
 class BypassResponse(BaseModel):
     final_url: str
@@ -50,221 +52,229 @@ class BypassResponse(BaseModel):
     captcha_detected: bool
     screenshot_b64: Optional[str] = None
     attempts_made: int
+    nav_history: Optional[List[str]] = None
 
-# === Helpers ===
+# ====== Helpers ======
+def looks_shortener(u: Optional[str]) -> bool:
+    if not u:
+        return False
+    s = u.lower()
+    return "gplinks" in s or "get2.in" in s or "short" in s  # conservative
+
 def looks_final(u: Optional[str]) -> bool:
     if not u:
         return False
-    u_l = u.lower()
-    # consider final when it's no longer a "gplinks" short-domain
-    return ("gplinks.co" not in u_l) and ("gplinks" not in u_l)
+    s = u.lower()
+    # treat URL as "final" when it doesn't look like gplinks/get2 or common shortener
+    return ("gplinks.co" not in s) and ("get2.in" not in s) and ("gplinks" not in s)
 
-def try_decode_get2_in(url: str) -> Optional[str]:
-    """
-    Try to decode get2.in style targets (base64 or URL encoded).
-    """
+def resolve_href(base: str, href: str) -> str:
     try:
-        parsed = urlparse(url)
-        if "get2.in" not in parsed.netloc.lower():
-            return None
-        query = parsed.query or parsed.path.split("?", 1)[-1]
-        if not query:
-            return None
-        candidate = None
-        if "=" in query:
-            parts = query.split("&")
-            # prefer long value parts
-            for p in parts:
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    if len(v) > 8:
-                        candidate = v
-                        break
-            if not candidate:
-                candidate = parts[-1].split("=", 1)[-1]
-        else:
-            candidate = query
-        if not candidate:
-            return None
-        cand = unquote(candidate)
-        # try base64 urlsafe decode
-        try:
-            b = cand.encode("utf-8")
-            padding = (-len(b)) % 4
-            if padding:
-                b += b"=" * padding
-            decoded = base64.urlsafe_b64decode(b).decode(errors="ignore")
-            if decoded.startswith("http"):
-                return decoded
-        except Exception:
-            pass
-        # fallback: if cand itself looks like URL
-        if cand.startswith("http"):
-            return cand
+        return urljoin(base, href)
     except Exception:
-        logger.exception("decode get2.in failed")
-    return None
+        return href
 
 async def take_screenshot_b64(page: Page) -> str:
     b = await page.screenshot(full_page=True)
     return base64.b64encode(b).decode()
 
-# === New helper: search page for heroku generate link ===
-async def find_heroku_generate_in_page(page: Page) -> Optional[str]:
+# ====== Smart click helper: clicks "Get Link" like elements ======
+async def try_click_getlink_elements(page: Page, logger_fn=None) -> Optional[str]:
     """
-    Inspect the current page for any herokuapp URL (preferably one containing '/generate?code=').
-    Returns the discovered URL or None.
+    Find and click elements that look like "Get Link" / "Get Link" actions.
+    Return a final URL if clicking caused navigation or href looks final.
     """
+    patterns = ["get link", "get-link", "getlink", "get now", "show link", "click here",
+                "continue", "open link", "get url", "get code", "generate", "download"]
+
     try:
-        # get page HTML/content
-        content = ""
+        els = await page.query_selector_all("a, button, input[type=button], input[type=submit]")
+    except Exception:
+        els = []
+
+    base_url = page.url
+    for el in els:
         try:
-            content = await page.content()
-        except Exception:
-            content = ""
-
-        # 1) look for direct generate?code= links in HTML
-        m = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', content, re.IGNORECASE)
-        if m:
-            return m.group(0)
-
-        # 2) any herokuapp link (candidate)
-        m2 = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com[^\s"\'<>"]*', content, re.IGNORECASE)
-        if m2:
-            candidate = m2.group(0)
-            # try to find a nearby code/token in the page to append if needed
-            code_match = re.search(r'(?:code|token)\s*[:=]\s*[\'"]([A-Za-z0-9_\-]{8,256})[\'"]', content)
-            if code_match:
-                return candidate.rstrip('/') + '/generate?code=' + code_match.group(1)
-            return candidate
-
-        # 3) detect base64-like strings that decode to heroku generate url
-        b64_matches = re.findall(r'["\']([A-Za-z0-9_\-]{16,}={0,2})["\']', content)
-        for cand in b64_matches:
+            text = ""
+            aria = ""
+            href = None
             try:
-                padding = (-len(cand)) % 4
-                bs = cand.encode()
-                if padding:
-                    bs += b"=" * padding
-                dec = base64.urlsafe_b64decode(bs).decode(errors="ignore")
-                if "herokuapp.com" in dec and "generate" in dec:
-                    return dec
+                text = (await el.inner_text() or "").strip().lower()
             except Exception:
-                pass
+                text = ""
+            try:
+                aria = (await el.get_attribute("aria-label") or "").strip().lower()
+            except Exception:
+                aria = ""
+            try:
+                href = await el.get_attribute("href")
+            except Exception:
+                href = None
 
-        # 4) evaluate page innerText (helpful to catch JS-constructed strings)
-        try:
-            js_text = await page.evaluate("() => { return document.body.innerText || document.documentElement.innerText || '' }")
-            if js_text:
-                m3 = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s]+generate\?code=[A-Za-z0-9_\-]+', js_text, re.IGNORECASE)
-                if m3:
-                    return m3.group(0)
+            combined = f"{text} {aria}".strip()
+            if any(p in combined for p in patterns):
+                if logger_fn:
+                    logger_fn(f"click candidate: text='{combined[:60]}' href={href}")
+                # click attempt
+                try:
+                    await el.click(timeout=CLICK_TIMEOUT)
+                except Exception:
+                    # fallback using evaluate
+                    try:
+                        await page.evaluate("(e)=>e.click()", el)
+                    except Exception:
+                        pass
+                # allow some time for navigation/xhr
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    await page.wait_for_timeout(1200)
+
+                # if navigation happened:
+                new_url = page.url
+                if new_url and new_url != base_url:
+                    # try to prefer a heroku-like generate if present in page HTML
+                    try:
+                        txt = await page.content()
+                        m = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', txt)
+                        if m:
+                            return m.group(0)
+                    except Exception:
+                        pass
+                    return new_url
+
+                # if no navigation, but href looks final, return it
+                if href:
+                    full = resolve_href(base_url, href)
+                    if looks_final(full) or "herokuapp.com" in full or "/generate?code=" in full:
+                        return full
+
+                # check page for heroku in case it's been injected
+                try:
+                    txt = await page.content()
+                    m2 = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', txt)
+                    if m2:
+                        return m2.group(0)
+                except Exception:
+                    pass
         except Exception:
             pass
-
-    except Exception:
-        logger.exception("Error while searching for heroku generate URL on page")
     return None
 
-# === Core attempt function (integrates heroku search) ===
-async def bypass_once(page: Page, url: str, attempt_num: int, progress_logger=None):
+# ====== Network listener helper (optional, used to capture interesting responses) ======
+def make_response_listener(found_set: Set[str]):
+    async def on_response(resp: Response):
+        try:
+            u = resp.url
+            if "herokuapp.com" in u or "/generate?code=" in u:
+                found_set.add(u)
+            # small, best-effort body check for interesting urls if content-type text/json
+            try:
+                ct = resp.headers.get("content-type", "")
+                if ("json" in ct or "text" in ct) and len(u) < 400:
+                    txt = await resp.text()
+                    m = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', txt)
+                    if m:
+                        found_set.add(m.group(0))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return on_response
+
+# ====== Main single attempt: follow navigation chain, clicking 'get' buttons etc ======
+async def bypass_once(page: Page, url: str, attempt_num: int, logger_fn=None):
     result = {"final_url": url, "raw_last_url": url, "captcha_detected": False, "screenshot_b64": None}
+    nav_history: List[str] = []
+    found_network_urls: Set[str] = set()
+
+    # register response listener
+    listener = make_response_listener(found_network_urls)
+    page.on("response", listener)
+
     try:
-        if progress_logger:
-            progress_logger(f"[attempt {attempt_num}] goto {url}")
+        if logger_fn:
+            logger_fn(f"[attempt {attempt_num}] goto {url}")
         try:
             await page.goto(url, timeout=NAV_TIMEOUT)
         except PlaywrightTimeoutError:
-            logger.warning("page.goto timeout on attempt %s", attempt_num)
-        except Exception:
-            logger.exception("page.goto error attempt %s", attempt_num)
+            if logger_fn:
+                logger_fn("page.goto timeout")
+        except Exception as e:
+            if logger_fn:
+                logger_fn(f"page.goto exception: {e}")
 
-        # try early redirect button click (common on gplinks)
+        # initial wait (you requested 5s)
         try:
-            btn = await page.wait_for_selector("a#btn-main, button#btn-main, a[role='button']", timeout=15000)
-            if btn:
-                try:
-                    if progress_logger:
-                        progress_logger(f"[attempt {attempt_num}] found redirect button; clicking")
-                    await btn.click(timeout=CLICK_TIMEOUT)
-                    await page.wait_for_timeout(1500)
-                except Exception:
-                    logger.debug("redirect button click failed")
+            await page.wait_for_timeout(WAIT_AFTER_OPEN * 1000)
         except Exception:
             pass
 
-        start = time.time()
+        # record initial url
+        nav_history.append(page.url)
+
+        start_time = time.time()
         last_url = page.url
-        while time.time() - start < MAX_TOTAL_WAIT:
+
+        # small helper to append to history (guard duplicates)
+        def push_history(u: str):
+            if not u:
+                return
+            if not nav_history or nav_history[-1] != u:
+                nav_history.append(u)
+
+        # main follow loop
+        while time.time() - start_time < MAX_TOTAL_WAIT and len(nav_history) < MAX_NAV_HISTORY:
             current_url = page.url
             result["raw_last_url"] = current_url
 
-            # 1) handle get2.in decoding if encountered
-            decoded = try_decode_get2_in(current_url)
-            if decoded:
-                # navigate to decoded target so we can inspect it
+            # if network found an interesting URL, prefer it immediately
+            if found_network_urls:
+                chosen = sorted(found_network_urls)[0]
+                result["final_url"] = chosen
                 try:
-                    if progress_logger:
-                        progress_logger(f"[attempt {attempt_num}] decoded get2.in -> navigating to decoded target")
-                    await page.goto(decoded, timeout=15000)
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
                 except Exception:
                     pass
+                result["raw_last_url"] = current_url
+                result["nav_history"] = nav_history
+                return result
 
-                # try to find heroku link on decoded page (give it a few seconds)
-                heroku_target = None
-                end_time = time.time() + 6
-                while time.time() < end_time:
-                    heroku_target = await find_heroku_generate_in_page(page)
-                    if heroku_target:
-                        break
+            # try clicking get-link elements (primary)
+            click_res = await try_click_getlink_elements(page, logger_fn=logger_fn)
+            if click_res:
+                push_history(page.url)
+                result["final_url"] = click_res
+                try:
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                except Exception:
+                    pass
+                result["raw_last_url"] = page.url
+                result["nav_history"] = nav_history
+                return result
+
+            # update history if URL changed
+            if page.url != last_url:
+                last_url = page.url
+                push_history(last_url)
+
+            # look for heroku direct in page content
+            try:
+                cont = await page.content()
+                m = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', cont)
+                if m:
+                    result["final_url"] = m.group(0)
                     try:
-                        await page.wait_for_timeout(1000)
+                        result["screenshot_b64"] = await take_screenshot_b64(page)
                     except Exception:
-                        break
+                        pass
+                    result["raw_last_url"] = page.url
+                    result["nav_history"] = nav_history
+                    return result
+            except Exception:
+                pass
 
-                if heroku_target:
-                    result["final_url"] = heroku_target
-                else:
-                    result["final_url"] = decoded
-                try:
-                    result["screenshot_b64"] = await take_screenshot_b64(page)
-                except Exception:
-                    pass
-                return result
-
-            # 2) attempt Heroku discovery on current page before accepting it as final
-            heroku_target = await find_heroku_generate_in_page(page)
-            if heroku_target:
-                result["final_url"] = heroku_target
-                try:
-                    result["screenshot_b64"] = await take_screenshot_b64(page)
-                except Exception:
-                    pass
-                return result
-
-            # 3) if we left gplinks domain, scan for HEROKU for a bit longer (dynamic JS)
-            if looks_final(current_url) and current_url != url:
-                heroku_target = None
-                end_time = time.time() + 8  # wait up to 8s for JS to populate target
-                while time.time() < end_time:
-                    heroku_target = await find_heroku_generate_in_page(page)
-                    if heroku_target:
-                        break
-                    try:
-                        await page.wait_for_timeout(1000)
-                    except Exception:
-                        break
-                if heroku_target:
-                    result["final_url"] = heroku_target
-                else:
-                    result["final_url"] = current_url
-                try:
-                    result["screenshot_b64"] = await take_screenshot_b64(page)
-                except Exception:
-                    pass
-                return result
-
-            # 4) detect captcha in page content
+            # detect captcha-like content
             try:
                 content = await page.content()
             except Exception:
@@ -275,9 +285,111 @@ async def bypass_once(page: Page, url: str, attempt_num: int, progress_logger=No
                     result["screenshot_b64"] = await take_screenshot_b64(page)
                 except Exception:
                     pass
+                result["raw_last_url"] = page.url
+                result["nav_history"] = nav_history
                 return result
 
-            # 5) try clicking common selectors (anchors/buttons)
+            # if the page looks like it left the shortener domain, give JS a short extra window to produce final links
+            if looks_final(current_url) and current_url != url:
+                # attempt aggressive clicks & scans for a few seconds
+                extra_end = time.time() + 8
+                while time.time() < extra_end:
+                    # network-first check
+                    if found_network_urls:
+                        chosen = sorted(found_network_urls)[0]
+                        result["final_url"] = chosen
+                        try:
+                            result["screenshot_b64"] = await take_screenshot_b64(page)
+                        except Exception:
+                            pass
+                        result["raw_last_url"] = page.url
+                        result["nav_history"] = nav_history
+                        return result
+
+                    click_res = await try_click_getlink_elements(page, logger_fn=logger_fn)
+                    if click_res:
+                        push_history(page.url)
+                        result["final_url"] = click_res
+                        try:
+                            result["screenshot_b64"] = await take_screenshot_b64(page)
+                        except Exception:
+                            pass
+                        result["raw_last_url"] = page.url
+                        result["nav_history"] = nav_history
+                        return result
+
+                    # scan scripts and innerText for obfuscated heroku links or base64
+                    try:
+                        scripts = await page.query_selector_all("script")
+                        for s in scripts:
+                            try:
+                                txt = await s.inner_text()
+                                if not txt:
+                                    continue
+                                m2 = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s"\'<>]*generate\?code=[^"&\'<>]+', txt)
+                                if m2:
+                                    result["final_url"] = m2.group(0)
+                                    try:
+                                        result["screenshot_b64"] = await take_screenshot_b64(page)
+                                    except Exception:
+                                        pass
+                                    result["raw_last_url"] = page.url
+                                    result["nav_history"] = nav_history
+                                    return result
+                                # try base64 decoding candidates
+                                b64s = re.findall(r'([A-Za-z0-9_\-]{20,}={0,2})', txt)
+                                for cand in b64s:
+                                    try:
+                                        padding = (-len(cand)) % 4
+                                        bs = cand.encode()
+                                        if padding:
+                                            bs += b"=" * padding
+                                        dec = base64.urlsafe_b64decode(bs).decode(errors="ignore")
+                                        if "herokuapp.com" in dec and "generate" in dec:
+                                            result["final_url"] = dec
+                                            try:
+                                                result["screenshot_b64"] = await take_screenshot_b64(page)
+                                            except Exception:
+                                                pass
+                                            result["raw_last_url"] = page.url
+                                            result["nav_history"] = nav_history
+                                            return result
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    try:
+                        txt = await page.evaluate("() => (document.body.innerText || '')")
+                        if txt:
+                            m3 = re.search(r'https?://[A-Za-z0-9\-.]+herokuapp\.com/[^\s]+generate\?code=[A-Za-z0-9_\-]+', txt)
+                            if m3:
+                                result["final_url"] = m3.group(0)
+                                try:
+                                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                                except Exception:
+                                    pass
+                                result["raw_last_url"] = page.url
+                                result["nav_history"] = nav_history
+                                return result
+                    except Exception:
+                        pass
+
+                    await page.wait_for_timeout(1000)
+
+                # after extra window, accept current_url as final if nothing found
+                result["final_url"] = page.url
+                try:
+                    result["screenshot_b64"] = await take_screenshot_b64(page)
+                except Exception:
+                    pass
+                result["raw_last_url"] = page.url
+                result["nav_history"] = nav_history
+                return result
+
+            # generic fallback clicks to progress the flow
             selectors = [
                 "a#btn-main", "a[href*='redirect']", "a[href*='http']",
                 "a.btn", "button#btn-main", "button", "input[type=submit]", "a[role='button']"
@@ -294,33 +406,41 @@ async def bypass_once(page: Page, url: str, attempt_num: int, progress_logger=No
                 except Exception:
                     pass
 
-            # 6) network idle wait
+            # small wait before next loop
             try:
                 await page.wait_for_load_state("networkidle", timeout=2000)
             except Exception:
                 pass
 
-            # update last_url and loop
             if page.url != last_url:
                 last_url = page.url
-            await page.wait_for_timeout(1000)
+                push_history(last_url)
 
-        # timeout reached: best-effort return last page and a screenshot
-        result["final_url"] = page.url
+            await page.wait_for_timeout(800)
+
+        # loop finished: best effort return last url
+        result["final_url"] = page.url or result["final_url"]
         try:
             result["screenshot_b64"] = await take_screenshot_b64(page)
         except Exception:
             pass
+        result["raw_last_url"] = page.url
+        result["nav_history"] = nav_history
         return result
 
     except Exception:
         logger.exception("Error in bypass_once")
+        result["nav_history"] = nav_history
         return result
+    finally:
+        try:
+            page.remove_listener("response", listener)
+        except Exception:
+            pass
 
-# === Endpoint ===
+# ====== API endpoint ======
 @app.post("/bypass", response_model=BypassResponse)
 async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(None)):
-    # API key check (optional)
     if API_KEY:
         if not x_api_key or x_api_key != API_KEY:
             raise HTTPException(status_code=401, detail="Missing/invalid API key")
@@ -346,27 +466,27 @@ async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(
         try:
             for i in range(1, attempts + 1):
                 attempt_made = i
-                # tiny human-like action
                 try:
-                    await page.mouse.move(100, 100)
+                    await page.mouse.move(120, 120)
                 except Exception:
                     pass
 
-                res = await bypass_once(page, url, i, progress_logger=lambda t: logger.info("BYPASS: %s", t))
+                res = await bypass_once(page, url, i, logger_fn=lambda t: logger.info("BYPASS: %s", t))
                 final.update(res)
-                # if captcha or we've discovered a heroku target, stop trying more attempts
+                # stop on captcha
                 if res.get("captcha_detected"):
                     break
-                # if final looks final and not still a gplinks short domain, break
+                # if final looks final and not a shortener, stop
                 if looks_final(final.get("final_url")) and "gplinks" not in (final.get("final_url") or "").lower():
                     break
-
+                # else retry
                 if i < attempts:
                     backoff = (2 ** i) + 0.5 * i
                     logger.info("Waiting %.1fs before retry %d", backoff, i + 1)
                     await page.wait_for_timeout(int(backoff * 1000))
                     try:
                         await page.reload(timeout=5000)
+                        await page.wait_for_timeout(1000)
                     except Exception:
                         pass
         finally:
@@ -379,7 +499,6 @@ async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(
             except Exception:
                 pass
 
-        # prepare response
         b64 = final.get("screenshot_b64") if include_screenshot else None
 
         return BypassResponse(
@@ -388,74 +507,86 @@ async def bypass_endpoint(req: BypassRequest, x_api_key: Optional[str] = Header(
             captcha_detected=bool(final.get("captcha_detected")),
             screenshot_b64=b64,
             attempts_made=attempt_made,
+            nav_history=final.get("nav_history") or []
         )
 
+# ====== Health & UI ======
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# === Web UI ===
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>GPLinks Bypass</title>
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;padding:20px;background:#f5f7fb}
-.container{max-width:920px;margin:auto;background:#fff;padding:24px;border-radius:8px;box-shadow:0 8px 30px rgba(20,20,50,0.05)}
-input[type=text]{width:72%;padding:10px;margin-right:8px;border:1px solid #ddd;border-radius:6px}
-button{padding:10px 14px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer}
-.small{color:#666;font-size:0.9rem}
-#spinner{display:none;margin-top:12px}
-pre{background:#f7f8fb;padding:12px;border-radius:6px;white-space:pre-wrap}
-img.debug{max-width:100%;border:1px solid #eee;margin-top:8px;border-radius:6px}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>GPLinks Follower</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#f5f7fb;padding:20px}
+    .card{max-width:900px;margin:20px auto;padding:20px;background:#fff;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,0.06)}
+    input[type=text]{width:68%;padding:10px;border-radius:6px;border:1px solid #ddd}
+    button{padding:8px 12px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer}
+    label{margin-left:8px}
+    pre{background:#f7f8fb;padding:12px;border-radius:6px;white-space:pre-wrap}
+    img.debug{max-width:100%;margin-top:8px;border-radius:6px}
+    #spinner{display:none;margin-top:10px}
+  </style>
 </head>
 <body>
-<div class="container">
-<h2>GPLinks Bypass Service</h2>
-<p class="small">Paste a GPLinks link and click <strong>Start</strong>. Optionally include a debug screenshot.</p>
-<input type="text" id="gplink" placeholder="https://gplinks.co/..." />
-<label style="margin-left:8px"><input type="checkbox" id="screenshot" /> Include screenshot</label>
-<button onclick="startBypass()">Start</button>
-<div id="spinner">⏳ Bypassing — this may take a few seconds...</div>
-<div id="output" style="margin-top:14px"></div>
-</div>
+  <div class="card">
+    <h2>GPLinks Follower — returns last opened link</h2>
+    <div>
+      <input id="gplink" type="text" placeholder="https://gplinks.co/..." />
+      <button onclick="startBypass()">Start</button>
+    </div>
+    <div style="margin-top:10px">
+      <label>Attempts: <input id="attempts" type="number" value="3" min="1" max="10" style="width:72px" /></label>
+      <label style="margin-left:12px"><input id="headless" type="checkbox" checked/> Headless</label>
+      <label style="margin-left:12px"><input id="screenshot" type="checkbox" /> Include screenshot</label>
+    </div>
+    <div id="spinner">⏳ Bypassing — please wait...</div>
+    <div id="output" style="margin-top:12px"></div>
+  </div>
 
 <script>
+function escapeHtml(s){ if(!s) return ''; return s.replace(/'/g,"\\'").replace(/"/g,'\\"'); }
+
 async function startBypass(){
-    const url = document.getElementById('gplink').value.trim();
-    const include_screenshot = document.getElementById('screenshot').checked;
-    if(!url){ alert('Please enter a GPLinks URL'); return; }
-    document.getElementById('spinner').style.display = 'block';
-    document.getElementById('output').innerHTML = '';
-    try{
-        const res = await fetch('/bypass', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({url: url, include_screenshot: include_screenshot, attempts: 3})
-        });
-        if(!res.ok){
-            const err = await res.json().catch(()=>({detail:res.statusText}));
-            document.getElementById('output').innerText = 'Error: ' + (err.detail || JSON.stringify(err));
-            return;
-        }
-        const data = await res.json();
-        let html = `<pre>✅ Final URL: ${data.final_url}\nAttempts Made: ${data.attempts_made}\nCaptcha Detected: ${data.captcha_detected}\nRaw Last URL: ${data.raw_last_url}</pre>`;
-        if(data.screenshot_b64){
-            html += `<p><a href="data:image/png;base64,${data.screenshot_b64}" download="screenshot.png">Download debug screenshot</a></p>`;
-            html += `<p><img class="debug" src="data:image/png;base64,${data.screenshot_b64}" /></p>`;
-        }
-        document.getElementById('output').innerHTML = html;
-    }catch(e){
-        document.getElementById('output').innerText = '⚠️ Error: ' + e;
-    }finally{
-        document.getElementById('spinner').style.display = 'none';
+  const url = document.getElementById('gplink').value.trim();
+  if(!url){ alert('Enter GPLinks URL'); return; }
+  document.getElementById('output').innerHTML = '';
+  document.getElementById('spinner').style.display = 'block';
+  const attempts = parseInt(document.getElementById('attempts').value || '3', 10);
+  const headless = document.getElementById('headless').checked;
+  const include_screenshot = document.getElementById('screenshot').checked;
+
+  try{
+    const res = await fetch('/bypass', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url:url, attempts:attempts, headless:headless, include_screenshot:include_screenshot})
+    });
+    if(!res.ok){
+      const err = await res.json().catch(()=>({detail:res.statusText}));
+      document.getElementById('output').innerText = 'Error: ' + (err.detail || JSON.stringify(err));
+      return;
     }
+    const data = await res.json();
+    let html = `<pre>✅ Final URL: ${data.final_url}\nAttempts: ${data.attempts_made}\nCaptcha Detected: ${data.captcha_detected}\nRaw Last URL: ${data.raw_last_url}\nNavigation history: ${JSON.stringify(data.nav_history || [])}</pre>`;
+    html += `<p><button onclick="window.open('${escapeHtml(data.final_url)}','_blank')">Open final URL</button></p>`;
+    if(data.screenshot_b64){
+      html += `<p><a href="data:image/png;base64,${data.screenshot_b64}" download="screenshot.png">Download screenshot</a></p>`;
+      html += `<p><img class="debug" src="data:image/png;base64,${data.screenshot_b64}" /></p>`;
+    }
+    document.getElementById('output').innerHTML = html;
+  }catch(e){
+    document.getElementById('output').innerText = 'Error: ' + e;
+  }finally{
+    document.getElementById('spinner').style.display = 'none';
+  }
 }
 </script>
 </body>
