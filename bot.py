@@ -1,16 +1,15 @@
-# gplinks_bot_aiogram37.py
+# gplinks_bot_aiogram37_ready.py
 """
-GPLinks bypass Telegram bot
-- aiogram 3.7+ compatible (uses Command filter decorators)
-- Playwright Chromium automation
-- Retries + human-like simulation + screenshots on CAPTCHA/failure
-- Runtime toggles via Telegram commands:
-    /set_headless on|off
-    /set_retries <n>
-    /set_mouse on|off
-    /status
-    /bypass <url>  (or reply to a message containing the URL)
-Only BOT_TOKEN env var is required.
+GPLinks bypass Telegram bot — aiogram 3.7+ ready and fully responsive.
+
+Features:
+- /start (friendly greeting)
+- /bypass <url> (or reply to a message containing a gplinks URL)
+- Accepts plain messages that include a gplinks URL (no /bypass required)
+- /set_headless on|off, /set_retries <n>, /set_mouse on|off, /status
+- Retries + human-like interactions + screenshots on CAPTCHA/failure
+- Progress messages edited in-chat
+Only BOT_TOKEN env var required.
 """
 
 import asyncio
@@ -19,15 +18,15 @@ import re
 import logging
 import time
 import random
-from urllib.parse import urljoin
 from typing import Optional
+from urllib.parse import urljoin
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import Message, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # -----------------------------
@@ -51,7 +50,7 @@ BASE_NAV_TIMEOUT = 60_000     # ms
 BASE_CLICK_TIMEOUT = 12_000   # ms
 MAX_TOTAL_WAIT = 30           # seconds per attempt loop
 SCREENSHOT_PATH = "/tmp/gplinks_debug.png"
-LOG_TO_TELEGRAM = True        # send progress updates to the invoking chat
+LOG_TO_TELEGRAM = True        # progress updates are sent to invoking chat
 TELEGRAM_LOG_CHAT_ID = None   # if set, logs always go to that chat id
 
 # Retry/backoff settings
@@ -62,9 +61,6 @@ JITTER_SEC = 1.5       # jitter for backoff
 MOUSE_MOVES_PER_ATTEMPT = 6
 CLICK_PROBABILITY = 0.35
 
-# Retry attempts default (can be changed at runtime via /set_retries)
-RETRY_ATTEMPTS_DEFAULT = CONFIG["RETRY_ATTEMPTS"]
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -73,6 +69,14 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
+
+
+# -----------------------------
+# Fallback filter to catch any text message
+# -----------------------------
+class AnyTextFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return bool(message.text)
 
 
 # -----------------------------
@@ -283,7 +287,7 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
     """
     Top-level orchestrator that runs multiple attempts and returns the best result.
     """
-    attempts = int(CONFIG.get("RETRY_ATTEMPTS", RETRY_ATTEMPTS_DEFAULT))
+    attempts = int(CONFIG.get("RETRY_ATTEMPTS", 3))
     headless = bool(CONFIG.get("HEADLESS", True))
     simulate_mouse = bool(CONFIG.get("SIMULATE_MOUSE", True))
 
@@ -359,18 +363,38 @@ async def bypass_gplinks(url: str, progress_callback=None) -> dict:
 
 
 # -----------------------------
-# URL extractor
+# URL extractor (more permissive)
 # -----------------------------
-def extract_url_from_text(text: str) -> Optional[str]:
+def extract_url_from_text(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
-    m = re.search(r'https?://(?:www\.)?gplinks\.co/[^\s]+', text, re.IGNORECASE)
-    return m.group(0) if m else None
+    # capture gplinks variants and shortlinks without protocol too
+    m = re.search(r'(https?://)?(?:www\.)?gplinks\.co/[^\s)]+', text, re.IGNORECASE)
+    if not m:
+        return None
+    found = m.group(0)
+    # ensure scheme present
+    if not found.lower().startswith("http"):
+        found = "https://" + found
+    return found
 
 
 # -----------------------------
 # Telegram command handlers: runtime toggles & status
 # -----------------------------
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.reply(
+        "👋 Hello! Send me a GPLinks.co URL (or reply to a message containing one) and I'll try to bypass it.\n\n"
+        "Commands:\n"
+        "/bypass <url> — bypass a link\n"
+        "/status — show current settings\n"
+        "/set_headless on|off\n"
+        "/set_retries <number>\n"
+        "/set_mouse on|off\n"
+    )
+
+
 @dp.message(Command("set_headless"))
 async def cmd_set_headless(message: Message):
     args = (message.text or "").split()
@@ -408,13 +432,13 @@ async def cmd_status(message: Message):
 
 
 # -----------------------------
-# Main message handler (accepts /bypass or raw message or replies)
+# Main message handler (catch any text)
 # -----------------------------
-@dp.message()  # generic message handler (no unsupported kwargs)
-async def handle_all_messages(message: Message):
+@dp.message(AnyTextFilter())
+async def handle_any_text(message: Message):
     text = (message.text or "").strip()
 
-    # accept /bypass <url>
+    # Accept /bypass <url> explicitly too
     if text.lower().startswith("/bypass"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -429,7 +453,11 @@ async def handle_all_messages(message: Message):
             target = extract_url_from_text(text)
 
     if not target:
-        return  # ignore unrelated messages
+        # no gplinks URL found — optionally respond with help if user asked /start-like texts
+        if text.lower().startswith("/start") or text.lower().startswith("hi") or text.lower().startswith("hello"):
+            await cmd_start(message)
+        # silently ignore other texts to avoid spam
+        return
 
     # start (editable) progress message
     progress_msg: Optional[Message] = None
@@ -483,7 +511,6 @@ async def handle_all_messages(message: Message):
 # Entrypoint
 # -----------------------------
 async def main():
-    # drop pending updates to avoid backlog
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
